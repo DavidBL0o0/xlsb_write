@@ -15,6 +15,7 @@ Table of contents:
 - [Formatting (`Format`, `Color`, borders, alignment, number formats)](#formatting)
 - [Number formats in depth](#number-formats-in-depth)
 - [Sheet layout (freeze panes, column/row sizing, merges)](#sheet-layout)
+- [Embedding images](#embedding-images)
 - [Formulas](#formulas)
 - [Full worked example](#full-worked-example)
 - [Error handling](#error-handling)
@@ -396,6 +397,61 @@ sheet.merge_range(first_row, first_col, last_row, last_col);
   — so call them any time before that point, there's no ordering constraint
   relative to `write_*` calls the way rows themselves have.
 
+## Embedding images
+
+```rust
+use xlsb_write::ImageFormat;
+
+let png_bytes: Vec<u8> = std::fs::read("logo.png")?;
+sheet.embed_image(first_row, first_col, last_row, last_col, &png_bytes, ImageFormat::Png);
+```
+
+- `embed_image(first_row, first_col, last_row, last_col, image_bytes, format)`
+  anchors the image to the inclusive rectangular cell range
+  `[first_row..=last_row] x [first_col..=last_col]` — write the range you'd
+  select in Excel before choosing Insert → Picture, using this crate's
+  usual zero-based `(row, col)` addressing.
+- **This is a "two-cell anchor"**: the image's on-screen size tracks the
+  actual column widths/row heights of the range it's anchored to. Widen a
+  column or heighten a row it spans, and the image grows with it — the
+  same behavior as inserting a picture "into" a cell range in Excel
+  itself, not a fixed-size picture that merely starts at that cell.
+  (Verified empirically against real Excel — see
+  [Correctness](#correctness-how-this-crate-is-verified).)
+- `ImageFormat` is `Png` or `Jpeg` — pass whichever matches your bytes.
+  `embed_image` checks the file's magic number against `format` and
+  panics on a mismatch (a PNG's bytes passed with `ImageFormat::Jpeg`, or
+  vice versa), since that would silently produce a picture Excel can't
+  decode.
+- `image_bytes` is written verbatim into `xl/media/imageN.<ext>` — this
+  crate never decodes, validates, resizes, or re-encodes image data.
+- A sheet can have any number of images (in different, or overlapping,
+  ranges); each becomes its own anchor inside that sheet's one shared
+  drawing part.
+- Works identically on `Worksheet`, `StreamingWorksheet` (via
+  `Deref`/`DerefMut`, like every other `Worksheet` method), and
+  `SizedStreamingWorksheet` — call it any time before the sheet is
+  finished; unlike `set_column_width`/`set_freeze_panes` on
+  `SizedStreamingWorksheet`, it has no "before the header is sent"
+  restriction, since an image isn't part of the header.
+
+```rust
+use xlsb_write::{ImageFormat, Workbook};
+
+let mut wb = Workbook::new();
+let sheet = wb.add_worksheet("Sheet1");
+sheet.write_string(0, 0, "Logo:");
+sheet.embed_image(1, 1, 5, 3, &png_bytes, ImageFormat::Png); // anchored to B2:D6
+wb.save("out.xlsb")?;
+```
+
+Not supported (out of scope for this first pass — see
+[Limitations](#limitations--whats-not-supported)): image resizing/
+cropping/rotation, transparency effects beyond what the source PNG/JPEG
+already encodes, formats other than PNG/JPEG (BMP, GIF, TIFF, EMF/WMF),
+and charts (a related but separate, larger subsystem — not implemented at
+all).
+
 ## Formulas
 
 `Formula` is a small expression builder — there's no text-formula parser
@@ -677,6 +733,23 @@ proxy for "will Excel accept this file," and PowerShell's
 `New-Object -ComObject Excel.Application` is the way to actually drive
 Excel itself if you want the real thing.
 
+**Embedded images specifically** (`embed_image`, 2026-09-13): this
+feature's entire OPC/drawing-XML shape was derived from a real Excel-
+authored reference, not the published spec text alone — the MS-XLSB HTML
+pages don't render the actual ABNF grammar file that would say where
+`BrtDrawing` belongs in the worksheet record stream. This session built a
+`.xlsb` from scratch with real Excel (COM automation: `Shapes.AddPicture`
+into a cell range, `SaveAs` format 50), inspected the produced zip
+directly (`xl/drawings/drawing1.xml`'s exact shape, both `_rels` files,
+`[Content_Types].xml`'s entries, and `BrtDrawing`'s exact byte position in
+`sheet1.bin` via `examples/dump_sheet.rs`), and confirmed this crate's own
+output opens with no repair prompt, reports the expected `Shapes.Count`
+and anchor cells (`Shape.TopLeftCell`/`BottomRightCell`), and genuinely
+resizes when the anchor range's column width/row height changes
+(distinguishing a real two-cell anchor from a fixed-size picture that
+merely starts at the right cell) — across all three worksheet types
+(`Workbook`, `StreamingWorkbook`, `SizedStreamingWorksheet`).
+
 ## Limitations — what's not supported
 
 This crate covers "data + formatting + formulas across one or many
@@ -687,7 +760,10 @@ sheets" — the common case for generating reports. It deliberately does
   [`calamine`](https://crates.io/crates/calamine) or
   [`pyxlsb`](https://github.com/willtrnr/pyxlsb) for Python.)
 - **Named ranges, print areas.**
-- **Charts, images, embedded objects.**
+- **Charts, embedded objects (OLE, ActiveX), image resizing/cropping/rotation,
+  image formats other than PNG/JPEG.** Embedding a plain PNG/JPEG image
+  anchored to a cell range *is* supported — see
+  [Embedding images](#embedding-images).
 - **Conditional formatting, data validation.**
 - **Hyperlinks.**
 - **Pivot tables.**
@@ -759,6 +835,11 @@ The crate is organized as:
 - `src/sst.rs` — the shared string table builder (`IndexMap<String, u32>`
   for O(1) lookup with preserved insertion order, which `BrtSst`'s
   index-ordering requirement needs).
+- `src/drawing.rs` — OPC parts for embedded images: `xl/media/imageN.<ext>`,
+  `xl/drawings/drawingN.xml` (regular DrawingML XML, per [MS-XLSB]'s own
+  scope — even inside an otherwise-binary `.xlsb`) and its `_rels`, and the
+  worksheet's own `_rels` file. The one binary-side hook (`BrtDrawing`) is
+  encoded in `src/sheet.rs`'s `write_sheet_footer`, not here.
 - `src/styles.rs` — `xl/styles.bin`: splices custom fonts/fills/borders/
   number-formats/cell-XFs onto a byte-verified reference base blob at
   dynamically-found offsets (not hardcoded — stays correct if the base

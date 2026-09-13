@@ -115,8 +115,20 @@ pub fn write_sheet_header(
     write_r0(0x0091, buf); // BrtBeginSheetData (145)
 }
 
+/// `BrtDrawing` (record 550) — [MS-XLSB] 2.4.354: a link to this sheet's
+/// `Drawings` part. Payload is `stRelId`, a `RelID`
+/// ([MS-XLSB] 2.5.115: an `XLNullableWideString`) naming the relationship
+/// in this sheet's own `.bin.rels` file — always `"rId1"` here, since this
+/// crate never emits `xl/worksheets/binaryIndexN.bin` (backlog item 11),
+/// so the drawing relationship is always the sheet's only one (see
+/// `drawing::sheet_rels`, which must agree with this constant).
+const RID_DRAWING: u32 = 550;
+
 /// `merges`: `(first_row, first_col, last_row, last_col)` per merged range.
-pub fn write_sheet_footer(merges: &[(u32, u32, u32, u32)], buf: &mut Vec<u8>) {
+/// `has_drawing`: whether this sheet has any embedded images — emits a
+/// `BrtDrawing` record pointing at `xl/worksheets/_rels/sheetN.bin.rels`'s
+/// `rId1` (the sheet's drawing relationship) when true.
+pub fn write_sheet_footer(merges: &[(u32, u32, u32, u32)], has_drawing: bool, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&[0x92, 0x01, 0x00]); // BrtEndSheetData (146)
 
     if !merges.is_empty() {
@@ -137,43 +149,73 @@ pub fn write_sheet_footer(merges: &[(u32, u32, u32, u32)], buf: &mut Vec<u8>) {
     }
 
     // 157 bytes verbatim from a real Excel-produced reference file (view/
-    // pane state, default column-break etc.) — re-extracted byte-for-byte
-    // from a fresh reference after the previous transcription of this
-    // array (during the earlier ROW_PRE refactor) turned out to be 8 bytes
-    // short, which was the actual cause of Excel discarding the worksheet
-    // part on open ("Replaced Part") — see write_sheet_header's BrtWsDim
-    // comment for the (unrelated, also real) other half of that bug.
+    // pane state, default column-break etc.), split into two halves so a
+    // `BrtDrawing` record can be spliced in between them when the sheet
+    // has an image — re-extracted byte-for-byte from a fresh reference
+    // after the previous transcription of this array (during the earlier
+    // ROW_PRE refactor) turned out to be 8 bytes short, which was the
+    // actual cause of Excel discarding the worksheet part on open
+    // ("Replaced Part") — see write_sheet_header's BrtWsDim comment for
+    // the (unrelated, also real) other half of that bug.
     //
     // Confirmed against a second, independently-produced real multi-sheet
     // Excel file (8 sheets vs. the original single-sheet reference) that
     // every byte here is identical across both files — EXCEPT the 16-byte
-    // value embedded in the middle (an
-    // `[MS-XLSB]` FRT-wrapped record, rid 3072): a real Excel file stamps
-    // a fresh value on every sheet, but this crate was copying the SAME 16
-    // bytes (from whichever one sheet the original reference happened to
-    // have) onto every sheet it ever wrote. Fixed below: that slice is now
-    // generated per sheet instead of baked into the static template.
-    const FOOTER_TAIL: &[u8] = &[
+    // value embedded in `FOOTER_TAIL_B` (an `[MS-XLSB]` FRT-wrapped
+    // record, rid 3072): a real Excel file stamps a fresh value on every
+    // sheet, but this crate was copying the SAME 16 bytes (from whichever
+    // one sheet the original reference happened to have) onto every sheet
+    // it ever wrote. Fixed below: that slice is now generated per sheet
+    // instead of baked into the static template.
+    //
+    // The split point (right after `BrtMargins`'s 48-byte payload, right
+    // before the rid-37 wrapper around the per-sheet FRT identifier) is
+    // exactly where a real Excel-authored `.xlsb` with an inserted picture
+    // places its own `BrtDrawing` record — confirmed 2026-09-13 by
+    // building one with Excel itself (COM automation) and dumping its
+    // `sheet1.bin` with `examples/dump_sheet.rs`; this ordering isn't
+    // documented anywhere the published MS-XLSB HTML pages render (the
+    // actual ABNF grammar file they cite isn't included), so it's trusted
+    // from that real reference file, not guessed from spec text alone.
+    #[rustfmt::skip]
+    const FOOTER_TAIL_A: &[u8] = &[
         0x97, 0x04, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xdd, 0x03, 0x02,
         0x10, 0x00, 0xdc, 0x03, 0x30, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0xe6, 0x3f, 0x66, 0x66, 0x66, 0x66, 0x66,
         0x66, 0xe6, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8,
-        0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f, 0x25,
+        0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f,
+    ];
+    // Starts with the rid-37 wrapper (`0x25, 0x06, ...`), then the rid-3072
+    // FRT-wrapped 16-byte identifier (placeholder here — replaced below,
+    // per-sheet), then the fixed 5-byte `[BrtEndList, BrtEndSheet]` tail.
+    #[rustfmt::skip]
+    const FOOTER_TAIL_B: &[u8] = &[
+        0x25,
         0x06, 0x01, 0x00, 0x00, 0x10, 0x00, 0x80, 0x80, 0x18, 0x10, 0xf0, 0xf8, 0x2a, 0xf4, 0xf1, 0x21, 0x6e, 0x47,
         0x9c, 0x59, 0xcf, 0x74, 0xd2, 0xaa, 0x32, 0x93, 0x26, 0x00, 0x82, 0x01, 0x00,
     ];
-    // The rid-3072 payload is the 16 bytes right before the fixed 5-byte
-    // `[BrtEndWsView-collection-terminator, BrtEndSheet]` tail — sliced by
-    // length from the end, not by a hand-counted offset from the start, so
-    // this can't silently drift out of sync if `FOOTER_TAIL` is ever
+    const FOOTER_B_GUID_START: usize = 11;
+    const FOOTER_B_GUID_LEN: usize = 16;
+
+    buf.extend_from_slice(FOOTER_TAIL_A);
+
+    if has_drawing {
+        let mut pay = Vec::new();
+        write_wstr("rId1", &mut pay);
+        write_rec(RID_DRAWING, &pay, buf);
+    }
+
+    // The rid-3072 payload is the 16 bytes at a fixed offset into
+    // `FOOTER_TAIL_B` (see the constants above) — sliced by fixed
+    // start/length, not by a hand-counted offset from the end, so this
+    // can't silently drift out of sync if `FOOTER_TAIL_B` is ever
     // re-transcribed.
-    let guid_end = FOOTER_TAIL.len() - 5;
-    let guid_start = guid_end - 16;
-    buf.extend_from_slice(&FOOTER_TAIL[..guid_start]);
+    let guid_end = FOOTER_B_GUID_START + FOOTER_B_GUID_LEN;
+    buf.extend_from_slice(&FOOTER_TAIL_B[..FOOTER_B_GUID_START]);
     buf.extend_from_slice(&crate::biff12::pseudo_unique_16_bytes());
-    buf.extend_from_slice(&FOOTER_TAIL[guid_end..]);
+    buf.extend_from_slice(&FOOTER_TAIL_B[guid_end..]);
 }
 
 /// `BrtColInfo` (rid 60): the first 18 bytes are the fields real readers
@@ -317,9 +359,9 @@ mod tests {
     #[test]
     fn footer_identifier_varies_between_sheets_rest_stays_fixed() {
         let mut buf1 = Vec::new();
-        write_sheet_footer(&[], &mut buf1);
+        write_sheet_footer(&[], false, &mut buf1);
         let mut buf2 = Vec::new();
-        write_sheet_footer(&[], &mut buf2);
+        write_sheet_footer(&[], false, &mut buf2);
 
         assert_eq!(
             buf1.len(),
@@ -346,5 +388,87 @@ mod tests {
             buf2[id_start..tail_start],
             "the identifier itself must differ"
         );
+    }
+
+    /// `has_drawing=false` (the default, for every sheet without an
+    /// embedded image) must not change the footer at all — a `BrtDrawing`
+    /// record referencing a `.rels` relationship that doesn't exist would
+    /// be a real corruption bug for the overwhelming majority of sheets
+    /// that never call `embed_image`.
+    #[test]
+    fn no_drawing_record_when_sheet_has_no_images() {
+        let mut buf = Vec::new();
+        write_sheet_footer(&[], false, &mut buf);
+        let recs = crate::biff12::parse_records(&buf);
+        assert!(
+            !recs.iter().any(|(rid, _)| *rid == RID_DRAWING),
+            "BrtDrawing must not appear when has_drawing is false"
+        );
+    }
+
+    /// `has_drawing=true` must emit exactly one `BrtDrawing` (rid 550)
+    /// record, with payload `stRelId = "rId1"` (an XLNullableWideString:
+    /// cch=4 + UTF-16LE "rId1") — the exact shape and value confirmed
+    /// against a real Excel-authored `.xlsb` with an inserted picture (see
+    /// this module's `write_sheet_footer` doc comment). It must sit right
+    /// after the margins/print-options records and before the per-sheet
+    /// FRT identifier, i.e. its position within the parsed record stream
+    /// must match where the real reference file put it.
+    #[test]
+    fn drawing_record_has_expected_payload_and_position() {
+        let mut buf = Vec::new();
+        write_sheet_footer(&[], true, &mut buf);
+        let recs = crate::biff12::parse_records(&buf);
+
+        let drawing_positions: Vec<usize> = recs
+            .iter()
+            .enumerate()
+            .filter(|(_, (rid, _))| *rid == RID_DRAWING)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(drawing_positions.len(), 1, "exactly one BrtDrawing record expected");
+
+        let (_, payload) = &recs[drawing_positions[0]];
+        let expected = {
+            let mut p = Vec::new();
+            write_wstr("rId1", &mut p);
+            p
+        };
+        assert_eq!(
+            payload, &expected,
+            "BrtDrawing payload must be the XLNullableWideString \"rId1\""
+        );
+
+        // Immediately followed by the rid-37 wrapper that starts
+        // FOOTER_TAIL_B (the per-sheet FRT identifier's envelope) —
+        // pinning this catches an accidental reordering relative to the
+        // real reference file's shape.
+        let (next_rid, _) = &recs[drawing_positions[0] + 1];
+        assert_eq!(
+            *next_rid, 37,
+            "BrtDrawing must be immediately followed by the rid-37 FRT wrapper"
+        );
+
+        // And the footer must still end in BrtEndSheet (130), same as
+        // when there's no drawing.
+        assert_eq!(recs.last().unwrap().0, 130, "footer must still end with BrtEndSheet");
+    }
+
+    /// A sheet with a drawing must produce a footer exactly
+    /// `BrtDrawing`'s own encoded length longer than one without —
+    /// nothing else should change size.
+    #[test]
+    fn drawing_record_adds_exactly_its_own_encoded_length() {
+        let mut without = Vec::new();
+        write_sheet_footer(&[], false, &mut without);
+        let mut with = Vec::new();
+        write_sheet_footer(&[], true, &mut with);
+
+        let mut expected_record = Vec::new();
+        let mut pay = Vec::new();
+        write_wstr("rId1", &mut pay);
+        write_rec(RID_DRAWING, &pay, &mut expected_record);
+
+        assert_eq!(with.len(), without.len() + expected_record.len());
     }
 }

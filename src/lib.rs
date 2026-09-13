@@ -13,14 +13,18 @@
 //! ```
 
 pub mod biff12;
+mod drawing;
 pub mod formula;
 mod sheet;
 mod sst;
 pub mod styles;
 mod wb_part;
 
+pub use drawing::ImageFormat;
 pub use formula::{FnIndex, Formula};
 pub use styles::{BorderStyle, Color, Format, HAlign, VAlign};
+
+use drawing::EmbeddedImage;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -96,6 +100,11 @@ pub struct Worksheet {
     col_specs: BTreeMap<u32, (f64, bool)>,
     row_specs: BTreeMap<u32, (f32, bool)>,
     merges: Vec<(u32, u32, u32, u32)>,
+    /// Images staged via `embed_image`, anchored to a cell range each.
+    /// Final `xl/media/imageN` numbering is assigned later, at sheet-finish
+    /// time (see `drawing::write_sheet_drawing_parts`), since it has to be
+    /// unique across the whole workbook, not just this sheet.
+    images: Vec<EmbeddedImage>,
     /// Encoded bytes for every row already finished (everything between
     /// `BrtBeginSheetData` and `BrtEndSheetData`) — grows incrementally as
     /// rows are written, instead of the whole sheet being held as a
@@ -122,6 +131,12 @@ struct PendingRow {
 const DEFAULT_COLUMN_WIDTH: f64 = 8.43;
 const DEFAULT_ROW_HEIGHT_PT: f32 = 15.0;
 
+/// Excel's real per-worksheet ceiling: 1,048,576 rows / 16,384 columns.
+/// Shared by `stage_cell` (cell writes) and `embed_image` (anchor ranges)
+/// — see `stage_cell`'s panic doc for why this is enforced at all.
+const MAX_ROW: u32 = 1_048_576;
+const MAX_COL: u32 = 16_384;
+
 impl Worksheet {
     fn new(name: &str, sst: Rc<RefCell<sst::Sst>>, style_builder: Rc<RefCell<styles::StylesBuilder>>) -> Self {
         Self {
@@ -135,6 +150,7 @@ impl Worksheet {
             col_specs: BTreeMap::new(),
             row_specs: BTreeMap::new(),
             merges: Vec::new(),
+            images: Vec::new(),
             body: Vec::new(),
             pending_row: None,
             dim: None,
@@ -200,8 +216,6 @@ impl Worksheet {
     ///   requires non-decreasing row order. Sort your data by row before
     ///   writing it.
     fn stage_cell(&mut self, row: u32, col: u32, value: CellValue, xf: u16) {
-        const MAX_ROW: u32 = 1_048_576;
-        const MAX_COL: u32 = 16_384;
         assert!(
             row < MAX_ROW && col < MAX_COL,
             "xlsb_write: cell ({row},{col}) is outside Excel's real worksheet limits \
@@ -413,9 +427,65 @@ impl Worksheet {
         self.merges.push((first_row, first_col, last_row, last_col));
         self
     }
+
+    /// Embed a raster image (PNG or JPEG), anchored to the rectangular
+    /// cell range `[first_row..=last_row] x [first_col..=last_col]` with a
+    /// **two-cell anchor**: the image's on-screen size tracks the actual
+    /// column widths/row heights of that range — confirmed empirically
+    /// (widen a column or heighten a row the image spans, and the image
+    /// grows with it), the same behavior as inserting a picture "into" a
+    /// cell range in real Excel — rather than a fixed pixel size at a
+    /// fixed position that merely happens to start at that cell.
+    ///
+    /// `image_bytes` is the raw, already-encoded file content (e.g. the
+    /// exact bytes of a `.png`/`.jpg` file on disk) — this crate does not
+    /// decode, validate, resize, or re-encode it; whatever you pass is
+    /// written verbatim into `xl/media/imageN.<ext>`.
+    ///
+    /// A sheet can have any number of images (in different, or even
+    /// overlapping, ranges) — each becomes its own anchor in that sheet's
+    /// one shared `xl/drawings/drawingN.xml` part.
+    ///
+    /// # Panics
+    /// - If `first_row > last_row` or `first_col > last_col`.
+    /// - If `last_row`/`last_col` is at or past Excel's real worksheet
+    ///   ceiling (same limits as `stage_cell`).
+    /// - If `image_bytes` doesn't start with `format`'s magic number (a
+    ///   mismatched `ImageFormat` would silently produce a picture Excel
+    ///   can't decode).
+    pub fn embed_image(
+        &mut self,
+        first_row: u32,
+        first_col: u32,
+        last_row: u32,
+        last_col: u32,
+        image_bytes: &[u8],
+        format: ImageFormat,
+    ) -> &mut Self {
+        assert!(
+            first_row <= last_row && first_col <= last_col,
+            "xlsb_write: embed_image range ({first_row},{first_col})..=({last_row},{last_col}) is \
+             inverted — first_row/first_col must be <= last_row/last_col."
+        );
+        assert!(
+            last_row < MAX_ROW && last_col < MAX_COL,
+            "xlsb_write: embed_image range extends to ({last_row},{last_col}), outside Excel's real \
+             worksheet limits (0..{MAX_ROW} rows x 0..{MAX_COL} columns)."
+        );
+        format.assert_matches(image_bytes);
+        self.images.push(EmbeddedImage {
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            format,
+            bytes: image_bytes.to_vec(),
+        });
+        self
+    }
 }
 
-fn zip_options() -> SimpleFileOptions {
+pub(crate) fn zip_options() -> SimpleFileOptions {
     SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(6))
@@ -432,6 +502,7 @@ fn finish_and_write_sheet<W: Write + Seek>(
     mut sheet: Worksheet,
     sheet_number: usize,
     active: bool,
+    next_media_index: &mut u32,
     zip: &mut ZipWriter<W>,
 ) -> Result<(), WriteError> {
     sheet.flush_pending_row(); // encode whatever row was still open
@@ -456,13 +527,16 @@ fn finish_and_write_sheet<W: Write + Seek>(
         active,
         &mut header,
     );
+    let has_drawing = !sheet.images.is_empty();
     let mut footer = Vec::new();
-    sheet::write_sheet_footer(&sheet.merges, &mut footer);
+    sheet::write_sheet_footer(&sheet.merges, has_drawing, &mut footer);
 
     zip.start_file(format!("xl/worksheets/sheet{sheet_number}.bin"), zip_options())?;
     zip.write_all(&header)?;
     zip.write_all(&sheet.body)?;
     zip.write_all(&footer)?;
+
+    drawing::write_sheet_drawing_parts(&sheet.images, sheet_number, next_media_index, zip)?;
     Ok(())
 }
 
@@ -507,8 +581,26 @@ impl Workbook {
         let sheet_names: Vec<&str> = self.sheets.iter().map(|s| s.name.as_str()).collect();
         let n = sheet_names.len();
 
+        // Computed from `&self.sheets` before the sheet loop below consumes
+        // it (via `into_iter()`) — [Content_Types].xml needs to know, up
+        // front, which sheets will end up with a drawing part and which
+        // image formats are in play, since it's written before any sheet's
+        // own parts are.
+        let drawing_sheets: Vec<usize> = self
+            .sheets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.images.is_empty())
+            .map(|(i, _)| i + 1)
+            .collect();
+        let image_formats: HashSet<ImageFormat> = self
+            .sheets
+            .iter()
+            .flat_map(|s| s.images.iter().map(|img| img.format))
+            .collect();
+
         zip.start_file("[Content_Types].xml", zip_options())?;
-        zip.write_all(content_types(n).as_bytes())?;
+        zip.write_all(content_types(n, &drawing_sheets, &image_formats).as_bytes())?;
 
         zip.start_file("_rels/.rels", zip_options())?;
         zip.write_all(ROOT_RELS.as_bytes())?;
@@ -526,6 +618,7 @@ impl Workbook {
         // sheet's encoded bytes in memory simultaneously just to write
         // sharedStrings.bin/styles.bin (whose content isn't final until all
         // sheets are processed) before the worksheet parts.
+        let mut next_media_index: u32 = 1;
         for (sheet_idx, sheet) in self.sheets.into_iter().enumerate() {
             // Only the first sheet is the active tab on open — every other
             // sheet must NOT have its own view marked "selected", or Excel
@@ -533,7 +626,7 @@ impl Workbook {
             // from Shift-clicking every tab: editing/filtering one sheet
             // then applies to all of them).
             let active = sheet_idx == 0;
-            finish_and_write_sheet(sheet, sheet_idx + 1, active, &mut zip)?;
+            finish_and_write_sheet(sheet, sheet_idx + 1, active, &mut next_media_index, &mut zip)?;
         }
 
         zip.start_file("xl/sharedStrings.bin", zip_options())?;
@@ -568,6 +661,16 @@ pub struct StreamingWorkbook<W: Write + Seek> {
     sst: Rc<RefCell<sst::Sst>>,
     style_builder: Rc<RefCell<styles::StylesBuilder>>,
     sheet_names: Vec<String>,
+    /// Shared across every sheet's images so `xl/media/imageN` numbering
+    /// stays unique workbook-wide (see `drawing::write_sheet_drawing_parts`).
+    next_media_index: u32,
+    /// 1-based sheet numbers that ended up with a drawing part — tracked
+    /// here (rather than recomputed in `finish`) because by the time
+    /// `finish` runs, every sheet has already been finished and dropped.
+    drawing_sheets: Vec<usize>,
+    /// Every distinct `ImageFormat` used anywhere in the workbook, for
+    /// `[Content_Types].xml`'s `Default Extension` entries.
+    image_formats: HashSet<ImageFormat>,
 }
 
 /// A `Worksheet` created by `StreamingWorkbook::new_worksheet`. Write cells
@@ -633,6 +736,11 @@ pub struct SizedStreamingWorksheet<'a, W: Write + Seek> {
     /// header says (freeze panes, column width/hidden) panics instead of
     /// being silently ignored.
     header_written: bool,
+    /// Borrowed from the parent `StreamingWorkbook` — see that struct's
+    /// same-named fields.
+    next_media_index: &'a mut u32,
+    drawing_sheets: &'a mut Vec<usize>,
+    image_formats: &'a mut HashSet<ImageFormat>,
 }
 
 impl<'a, W: Write + Seek> std::ops::Deref for SizedStreamingWorksheet<'a, W> {
@@ -880,11 +988,33 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
         self
     }
 
+    /// Same contract as `Worksheet::embed_image` — unlike the layout
+    /// methods above, this can be called any time before `finish()`
+    /// regardless of whether the header has already been sent: an image
+    /// isn't part of the header, it's written into the footer (see
+    /// `sheet::write_sheet_footer`'s `BrtDrawing`) and as separate OPC
+    /// parts, both handled by `finish()` itself.
+    pub fn embed_image(
+        &mut self,
+        first_row: u32,
+        first_col: u32,
+        last_row: u32,
+        last_col: u32,
+        image_bytes: &[u8],
+        format: ImageFormat,
+    ) -> &mut Self {
+        self.inner
+            .embed_image(first_row, first_col, last_row, last_col, image_bytes, format);
+        self
+    }
+
     /// Flush whatever row is still open, send the header if no row ever
     /// triggered it (an empty sheet, or one that never got past its first
-    /// row), write the footer, and close the zip entry. Call this once, per
-    /// sheet, instead of `StreamingWorkbook::finish_worksheet` (which takes
-    /// a `StreamingWorksheet`, not this type).
+    /// row), write the footer, close the zip entry, and (if any images were
+    /// staged via `embed_image`) write this sheet's media/drawing/rels
+    /// parts. Call this once, per sheet, instead of
+    /// `StreamingWorkbook::finish_worksheet` (which takes a
+    /// `StreamingWorksheet`, not this type).
     pub fn finish(mut self) -> Result<(), WriteError> {
         self.inner.flush_pending_row();
         if !self.header_written {
@@ -894,9 +1024,23 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
             self.zip.write_all(&self.inner.body)?;
             self.inner.body.clear();
         }
+        let has_drawing = !self.inner.images.is_empty();
         let mut footer = Vec::new();
-        sheet::write_sheet_footer(&self.inner.merges, &mut footer);
+        sheet::write_sheet_footer(&self.inner.merges, has_drawing, &mut footer);
         self.zip.write_all(&footer)?;
+
+        if has_drawing {
+            self.drawing_sheets.push(self.number);
+            for img in &self.inner.images {
+                self.image_formats.insert(img.format);
+            }
+        }
+        drawing::write_sheet_drawing_parts(
+            &self.inner.images,
+            self.number,
+            &mut *self.next_media_index,
+            &mut *self.zip,
+        )?;
         Ok(())
     }
 }
@@ -914,6 +1058,9 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
             sst: Rc::new(RefCell::new(sst::Sst::new())),
             style_builder: Rc::new(RefCell::new(styles::StylesBuilder::new())),
             sheet_names: Vec::new(),
+            next_media_index: 1,
+            drawing_sheets: Vec::new(),
+            image_formats: HashSet::new(),
         }
     }
 
@@ -932,7 +1079,19 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
     /// it — its `body` and everything else in it frees before the next
     /// sheet is even created.
     pub fn finish_worksheet(&mut self, sheet: StreamingWorksheet) -> Result<(), WriteError> {
-        finish_and_write_sheet(sheet.inner, sheet.number, sheet.active, &mut self.zip)
+        if !sheet.inner.images.is_empty() {
+            self.drawing_sheets.push(sheet.number);
+            for img in &sheet.inner.images {
+                self.image_formats.insert(img.format);
+            }
+        }
+        finish_and_write_sheet(
+            sheet.inner,
+            sheet.number,
+            sheet.active,
+            &mut self.next_media_index,
+            &mut self.zip,
+        )
     }
 
     /// Like `new_worksheet`, but the caller declares the sheet's used range
@@ -964,6 +1123,9 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
             last_row,
             last_col,
             header_written: false,
+            next_media_index: &mut self.next_media_index,
+            drawing_sheets: &mut self.drawing_sheets,
+            image_formats: &mut self.image_formats,
         }
     }
 
@@ -976,7 +1138,8 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
         let n = sheet_names.len();
 
         self.zip.start_file("[Content_Types].xml", zip_options())?;
-        self.zip.write_all(content_types(n).as_bytes())?;
+        self.zip
+            .write_all(content_types(n, &self.drawing_sheets, &self.image_formats).as_bytes())?;
 
         self.zip.start_file("_rels/.rels", zip_options())?;
         self.zip.write_all(ROOT_RELS.as_bytes())?;
@@ -1005,18 +1168,43 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
 
 // ── XML boilerplate ───────────────────────────────────────────────────────────
 
-fn content_types(n: usize) -> String {
+/// `drawing_sheets`: 1-based sheet numbers that have an
+/// `xl/drawings/drawingN.xml` part (i.e. at least one `embed_image` call).
+/// `image_formats`: every distinct `ImageFormat` used anywhere in the
+/// workbook — each gets its own `Default Extension` entry (only emitted
+/// when actually used, matching real Excel's own behavior: a workbook with
+/// no images declares neither).
+fn content_types(n: usize, drawing_sheets: &[usize], image_formats: &HashSet<ImageFormat>) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
          <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
          <Default Extension=\"bin\" ContentType=\"application/vnd.ms-excel.sheet.binary.macroEnabled.main\"/>\
          <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-         <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
-         <Override PartName=\"/xl/workbook.bin\" ContentType=\"application/vnd.ms-excel.sheet.binary.macroEnabled.main\"/>",
+         <Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+    );
+    // Sorted so output is deterministic regardless of HashSet iteration
+    // order (matters for tests/diffing, not for OPC correctness).
+    let mut formats: Vec<&ImageFormat> = image_formats.iter().collect();
+    formats.sort_by_key(|f| format!("{f:?}"));
+    for format in formats {
+        s.push_str(&format!(
+            "<Default Extension=\"{}\" ContentType=\"{}\"/>",
+            format.extension(),
+            format.content_type()
+        ));
+    }
+    s.push_str(
+        "<Override PartName=\"/xl/workbook.bin\" ContentType=\"application/vnd.ms-excel.sheet.binary.macroEnabled.main\"/>",
     );
     for i in 1..=n {
         s.push_str(&format!(
             "<Override PartName=\"/xl/worksheets/sheet{i}.bin\" ContentType=\"application/vnd.ms-excel.worksheet\"/>"
+        ));
+    }
+    for &i in drawing_sheets {
+        s.push_str(&format!(
+            "<Override PartName=\"/xl/drawings/drawing{i}.xml\" \
+             ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/>"
         ));
     }
     s.push_str(
