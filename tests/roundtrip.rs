@@ -3,7 +3,7 @@
 //! values match. This is the real proof the output is a valid Excel file,
 //! not just "produces a zip".
 
-use calamine::{open_workbook, Data, DataType, Reader, Xlsb};
+use calamine::{Data, DataType, Reader, Xlsb, open_workbook};
 use std::io::Cursor;
 use xlsb_write::{BorderStyle, Color, Format, Formula, HAlign, VAlign, Workbook};
 
@@ -87,7 +87,10 @@ fn roundtrip_multi_row_streaming_through_calamine() {
     let range = wbk.worksheet_range("Sheet1").expect("Sheet1 not found");
     for row in 0..5u32 {
         assert_eq!(range.get_value((row, 0)), Some(&Data::String(format!("row-{row}"))));
-        assert_eq!(range.get_value((row, 1)).and_then(Data::as_f64), Some(row as f64 * 10.0));
+        assert_eq!(
+            range.get_value((row, 1)).and_then(Data::as_f64),
+            Some(row as f64 * 10.0)
+        );
     }
 }
 
@@ -229,7 +232,12 @@ fn roundtrip_formulas_through_calamine() {
     sheet.write_formula_num(2, 1, Formula::num(5.0).mul(Formula::num(2.0)), 5.0 * 2.0); // 5*2 = 10
 
     sheet.write_formula_num(3, 0, Formula::sum_range(0, 0, 2, 0), total);
-    sheet.write_formula_num(3, 1, Formula::num(2.0).mul(Formula::cell(0, 0).add(Formula::num(5.0))), 2.0 * (10.0 + 5.0)); // 2*(A1+5) = 30, operand order swapped vs the first case
+    sheet.write_formula_num(
+        3,
+        1,
+        Formula::num(2.0).mul(Formula::cell(0, 0).add(Formula::num(5.0))),
+        2.0 * (10.0 + 5.0),
+    ); // 2*(A1+5) = 30, operand order swapped vs the first case
 
     let mut buf = Cursor::new(Vec::new());
     wb.write(&mut buf).unwrap();
@@ -279,8 +287,7 @@ fn roundtrip_if_iferror_through_calamine() {
     // (division by zero -> #DIV/0! -> ISERROR true -> default).
     sheet.write_number(1, 0, 10.0);
     sheet.write_number(1, 1, 0.0);
-    let iferr_div0 =
-        Formula::iferror(Formula::cell(1, 0).div(Formula::cell(1, 1)), Formula::str(""));
+    let iferr_div0 = Formula::iferror(Formula::cell(1, 0).div(Formula::cell(1, 1)), Formula::str(""));
     sheet.write_formula_str(1, 2, iferr_div0, "");
 
     // curr=10, prev=2 -> IFERROR(curr/prev, "") should take the value branch (5.0).

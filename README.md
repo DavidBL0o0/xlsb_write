@@ -59,6 +59,26 @@ cargo run --example sales_report
 complete formula builder, `Workbook` vs `StreamingWorkbook`, performance
 notes, and what's not supported — see [GUIDE.md](GUIDE.md).**
 
+## When to use this (and when not to)
+
+Be honest with yourself about which of these you actually need:
+
+- **Use `xlsb_write`** if you specifically need `.xlsb` output — existing
+  macro-enabled/`.xlsb`-based workflows, or reports large enough that
+  `.xlsx`'s XML overhead genuinely matters to you (disk size, Excel open
+  time), and you want a pure-Rust writer with no Excel/COM/Python
+  dependency.
+- **Use [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter)
+  instead** if you don't have a specific reason to need `.xlsb` — it's
+  far more complete today (charts, images, hyperlinks, data validation,
+  conditional formatting, named ranges, autofilter, and more), far more
+  mature, and produces the much more common `.xlsx` format. For most
+  "generate an Excel report from Rust" needs, it's the better default.
+
+This crate is actively growing its feature set (see the roadmap in
+`docs/` if you're working from a clone) — the gap above is real today,
+not a permanent design choice.
+
 ## Status
 
 Byte-level output is verified against real Excel-produced reference files

@@ -11,14 +11,14 @@
 //! infrastructure only — no new public API is exercised beyond what
 //! `tests/roundtrip.rs` already covers elsewhere.
 
-use calamine::{open_workbook, Data, Reader, Xlsb};
+use calamine::{Data, Reader, Xlsb, open_workbook};
 use parquet::basic::Type as PhysicalType;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use xlsb_write::biff12::try_parse_records;
-use xlsb_write::{Color, Format, Formula, StreamingWorkbook, WriteError, Worksheet};
+use xlsb_write::{Color, Format, Formula, StreamingWorkbook, Worksheet, WriteError};
 use zip::ZipArchive;
 
 fn field_as_f64(f: &Field) -> Option<f64> {
@@ -122,15 +122,20 @@ fn populate_generic_sheet(sheet: &mut Worksheet, path: &Path) -> SheetShape {
     }
 
     let has_sum_row = first_numeric_col.is_some() && num_rows >= 1;
-    if let Some(fc) = first_numeric_col {
-        if num_rows >= 1 {
-            let sum_row = row_idx;
-            let formula = Formula::sum_range(1, fc, row_idx - 1, fc);
-            sheet.write_formula_num(sum_row, fc, formula, running_sum);
-        }
+    if let Some(fc) = first_numeric_col
+        && num_rows >= 1
+    {
+        let sum_row = row_idx;
+        let formula = Formula::sum_range(1, fc, row_idx - 1, fc);
+        sheet.write_formula_num(sum_row, fc, formula, running_sum);
     }
 
-    SheetShape { data_rows: num_rows, cols: num_cols, first_blank_cell, has_sum_row }
+    SheetShape {
+        data_rows: num_rows,
+        cols: num_cols,
+        first_blank_cell,
+        has_sum_row,
+    }
 }
 
 fn is_blank(v: Option<&Data>) -> bool {
@@ -144,7 +149,7 @@ fn is_blank(v: Option<&Data>) -> bool {
 /// not just the first.
 fn check_case(path: &Path, case_index: usize, failures: &mut Vec<String>) {
     let label = path.file_name().unwrap().to_string_lossy().to_string();
-    let bytes = if case_index % 2 == 0 {
+    let bytes = if case_index.is_multiple_of(2) {
         let mut wb = xlsb_write::Workbook::new();
         let sheet = wb.add_worksheet("Sheet1");
         let shape = populate_generic_sheet(sheet, path);
@@ -178,7 +183,9 @@ fn check_case(path: &Path, case_index: usize, failures: &mut Vec<String>) {
     // stream (same method as examples/validate_xlsb.rs).
     match ZipArchive::new(Cursor::new(&bytes)) {
         Ok(mut zip) => {
-            let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+            let names: Vec<String> = (0..zip.len())
+                .map(|i| zip.by_index(i).unwrap().name().to_string())
+                .collect();
             for name in &names {
                 if !name.ends_with(".bin") {
                     continue;
@@ -215,12 +222,17 @@ fn check_case(path: &Path, case_index: usize, failures: &mut Vec<String>) {
                     }
                 }
                 if cols as u32 != shape.cols {
-                    failures.push(format!("{label}: calamine reports {cols} cols, expected {}", shape.cols));
+                    failures.push(format!(
+                        "{label}: calamine reports {cols} cols, expected {}",
+                        shape.cols
+                    ));
                 }
                 if let Some((r, c)) = shape.first_blank_cell {
                     let v = range.get_value((r, c));
                     if !is_blank(v) {
-                        failures.push(format!("{label}: cell ({r},{c}) written as blank, calamine read back {v:?}"));
+                        failures.push(format!(
+                            "{label}: cell ({r},{c}) written as blank, calamine read back {v:?}"
+                        ));
                     }
                 }
             }
@@ -242,7 +254,10 @@ fn random_case_files() -> Vec<PathBuf> {
         .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
         .collect();
     files.sort();
-    assert!(!files.is_empty(), "test_fixtures/random/ exists but has no .parquet files — regenerate the fixtures");
+    assert!(
+        !files.is_empty(),
+        "test_fixtures/random/ exists but has no .parquet files — regenerate the fixtures"
+    );
     files
 }
 
@@ -253,5 +268,11 @@ fn random_matrix_shapes_survive_generic_write_and_reopen() {
     for (i, path) in files.iter().enumerate() {
         check_case(path, i, &mut failures);
     }
-    assert!(failures.is_empty(), "{} of {} random-shape cases failed:\n{}", failures.len(), files.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} of {} random-shape cases failed:\n{}",
+        failures.len(),
+        files.len(),
+        failures.join("\n")
+    );
 }

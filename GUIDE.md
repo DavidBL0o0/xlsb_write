@@ -464,14 +464,19 @@ FnIndex::COUNT, FnIndex::ISNA, FnIndex::ISERROR,
 FnIndex::SUM, FnIndex::AVERAGE, FnIndex::MIN, FnIndex::MAX, FnIndex::ROUND
 ```
 
-These are the only function indices currently exposed publicly (`FnIndex`'s
-inner value is crate-private, so you can't construct an arbitrary one from
-outside the crate). `Formula::sum_range(...)` is the one convenience
-constructor provided; for any other function, you'd currently need to
-extend `FnIndex` in the crate itself (see
-[Internals](#internals-for-contributors) — the `Ftab` index table is
-published in the MS-XLS spec, so adding a new function is a small,
-well-defined change).
+These are the only function indices this crate's own test suite has
+verified byte-for-byte against real Excel output — use one of them via
+`Formula::Func(FnIndex::SUM, args)` whenever possible.
+
+For a function not listed here (`VLOOKUP`, `SUMIF`, text/date functions,
+...), `FnIndex`'s inner value is public: `Formula::Func(FnIndex(0x0182),
+vec![...])` works without forking this crate. This is **unverified by
+this crate** — look the real index up yourself in the published MS-XLS
+`Ftab` enumeration (don't guess), and double-check the argument count you
+pass matches what the function actually requires (`PtgFuncVar`'s
+`cparams` byte is written from `args.len()` — a mismatch there is exactly
+the class of subtle bug this crate has hit before with its own built-in
+functions).
 
 **Use `Formula::sum_range` for a single-range `SUM`, not a hand-built
 `Formula::Func`.** A single-range `SUM` is the one case real Excel encodes
@@ -689,10 +694,11 @@ sheets" — the common case for generating reports. It deliberately does
 - **Cell comments/notes.**
 - **Per-side borders or diagonal borders** — `Format::set_border` applies
   one style to all four sides.
-- **Arbitrary formula functions** — only the `FnIndex` constants listed
-  under [Formulas](#formulas) are exposed; there's no text-formula parser
-  and no public way to reference an arbitrary `Ftab` index from outside
-  the crate.
+- **No text-formula parser** — there's no way to pass `"=VLOOKUP(...)"` as
+  a string; formulas are always built via `Formula`'s method calls. Any
+  `Ftab` function can be referenced via `FnIndex(raw_index)` (see
+  [Formulas](#formulas)), but only the listed constants are verified
+  against real Excel output by this crate's own tests.
 - **Shared formulas / array formulas** — every formula cell is written as
   its own independent `BrtFmlaNum`/`BrtFmlaString` record.
 - **Relative cell references in formulas** (`$`-style semantics) — every

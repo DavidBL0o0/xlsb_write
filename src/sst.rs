@@ -24,7 +24,10 @@ pub struct Sst {
 
 impl Sst {
     pub fn new() -> Self {
-        Self { map: IndexMap::new(), total_refs: 0 }
+        Self {
+            map: IndexMap::new(),
+            total_refs: 0,
+        }
     }
 
     /// Insert a string and return its SST index (idempotent for the index;
@@ -44,19 +47,6 @@ impl Sst {
         let idx = self.map.len() as u32;
         self.map.insert(s.to_owned(), idx);
         idx
-    }
-
-    /// Look up a string without inserting.
-    pub fn get(&self, s: &str) -> Option<u32> {
-        self.map.get(s).copied()
-    }
-
-    pub fn len(&self) -> u32 {
-        self.map.len() as u32
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 
     /// Encode the complete sharedStrings.bin binary.
@@ -111,7 +101,7 @@ mod tests {
         assert_eq!(sst.intern("hello"), 0);
         assert_eq!(sst.intern("world"), 1);
         assert_eq!(sst.intern("hello"), 0); // same index
-        assert_eq!(sst.len(), 2);
+        assert_eq!(sst.map.len(), 2);
     }
 
     /// Regression: cstTotal (references, including repeats) must NOT be

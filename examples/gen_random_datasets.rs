@@ -32,16 +32,56 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    Case { rows: 0, cols: 1, col_type_start: 2 }, // empty, single string column
-    Case { rows: 1, cols: 1, col_type_start: 0 }, // minimal, single numeric column
-    Case { rows: 1, cols: 40, col_type_start: 1 }, // wide, one row
-    Case { rows: 7, cols: 3, col_type_start: 0 },
-    Case { rows: 7, cols: 40, col_type_start: 3 },
-    Case { rows: 500, cols: 3, col_type_start: 2 },
-    Case { rows: 500, cols: 12, col_type_start: 0 },
-    Case { rows: 500, cols: 40, col_type_start: 4 },
-    Case { rows: 20_000, cols: 3, col_type_start: 1 },
-    Case { rows: 20_000, cols: 12, col_type_start: 0 },
+    Case {
+        rows: 0,
+        cols: 1,
+        col_type_start: 2,
+    }, // empty, single string column
+    Case {
+        rows: 1,
+        cols: 1,
+        col_type_start: 0,
+    }, // minimal, single numeric column
+    Case {
+        rows: 1,
+        cols: 40,
+        col_type_start: 1,
+    }, // wide, one row
+    Case {
+        rows: 7,
+        cols: 3,
+        col_type_start: 0,
+    },
+    Case {
+        rows: 7,
+        cols: 40,
+        col_type_start: 3,
+    },
+    Case {
+        rows: 500,
+        cols: 3,
+        col_type_start: 2,
+    },
+    Case {
+        rows: 500,
+        cols: 12,
+        col_type_start: 0,
+    },
+    Case {
+        rows: 500,
+        cols: 40,
+        col_type_start: 4,
+    },
+    Case {
+        rows: 20_000,
+        cols: 3,
+        col_type_start: 1,
+    },
+    Case {
+        rows: 20_000,
+        cols: 12,
+        col_type_start: 0,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -127,9 +167,9 @@ fn build_unique_string_column(rng: &mut StdRng, rows: usize) -> Vec<Option<Strin
                 return None;
             }
             match i % 4 {
-                0 => Some(String::new()),                          // empty string
-                1 => Some("x".repeat(500)),                        // long string
-                2 => Some(random_unicode_word(rng)),                // unicode
+                0 => Some(String::new()),                              // empty string
+                1 => Some("x".repeat(500)),                            // long string
+                2 => Some(random_unicode_word(rng)),                   // unicode
                 _ => Some(format!("row-{i}-{}", rng.random::<u32>())), // unique
             }
         })
@@ -137,7 +177,15 @@ fn build_unique_string_column(rng: &mut StdRng, rows: usize) -> Vec<Option<Strin
 }
 
 fn build_bool_column(rng: &mut StdRng, rows: usize) -> Vec<Option<bool>> {
-    (0..rows).map(|_| if rng.random_bool(NULL_RATE) { None } else { Some(rng.random_bool(0.5)) }).collect()
+    (0..rows)
+        .map(|_| {
+            if rng.random_bool(NULL_RATE) {
+                None
+            } else {
+                Some(rng.random_bool(0.5))
+            }
+        })
+        .collect()
 }
 
 fn build_case_df(rng: &mut StdRng, case: &Case) -> DataFrame {
@@ -167,7 +215,9 @@ fn main() {
         let mut df = build_case_df(&mut rng, case);
         let path = out_dir.join(format!("case_{i:02}_{}x{}.parquet", case.rows, case.cols));
         let file = File::create(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
-        ParquetWriter::new(file).finish(&mut df).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        ParquetWriter::new(file)
+            .finish(&mut df)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
         println!("wrote {} ({} rows x {} cols)", path.display(), case.rows, case.cols);
     }
 

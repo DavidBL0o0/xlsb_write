@@ -7,8 +7,10 @@
 
 fn main() {
     let hex: String = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
-    let bytes: Vec<u8> =
-        hex.split_whitespace().map(|b| u8::from_str_radix(b, 16).expect("bad hex byte")).collect();
+    let bytes: Vec<u8> = hex
+        .split_whitespace()
+        .map(|b| u8::from_str_radix(b, 16).expect("bad hex byte"))
+        .collect();
 
     let mut i = 0usize;
     while i < bytes.len() {

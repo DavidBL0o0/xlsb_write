@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build+test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (lib, tests, examples)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (lib + all examples)
+        run: cargo build --all-targets
+
+      - name: Generate randomized-robustness fixtures
+        run: cargo run --example gen_random_datasets
+
+      - name: Test
+        run: cargo test
+
+  package:
+    name: cargo package / publish --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo package --list (fails the build if anything unexpected would ship)
+        run: cargo package --list
+
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run

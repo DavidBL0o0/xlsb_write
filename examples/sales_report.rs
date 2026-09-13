@@ -48,7 +48,13 @@ fn synthetic_records() -> Vec<Record> {
             for &month in MONTHS {
                 let units = 50 + (next() % 450) as i64;
                 let unit_price = 8.0 + (next() % 40) as f64 / 4.0;
-                records.push(Record { region, product, month, units, revenue: units as f64 * unit_price });
+                records.push(Record {
+                    region,
+                    product,
+                    month,
+                    units,
+                    revenue: units as f64 * unit_price,
+                });
             }
         }
     }
@@ -113,7 +119,10 @@ fn write_summary_sheet(wb: &mut StreamingWorkbook<File>, records: &[Record]) {
     let region_fmt = Format::new().set_border(BorderStyle::Thin);
     let value_fmt = Format::new().set_num_format("int").set_border(BorderStyle::Thin);
     let total_label_fmt = Format::new().set_bold().set_border(BorderStyle::Thin);
-    let total_value_fmt = Format::new().set_bold().set_num_format("int").set_border(BorderStyle::Thin);
+    let total_value_fmt = Format::new()
+        .set_bold()
+        .set_num_format("int")
+        .set_border(BorderStyle::Thin);
     let pct_fmt = Format::new().set_num_format("pct2").set_border(BorderStyle::Thin);
 
     let mut sheet = wb.new_worksheet("Summary");
@@ -174,10 +183,16 @@ fn write_summary_sheet(wb: &mut StreamingWorkbook<File>, records: &[Record]) {
         let inner_if = Formula::if_then_else(
             Formula::cell(row, curr_col).eq(Formula::num(0.0)),
             Formula::str(""),
-            Formula::cell(row, curr_col).div(Formula::cell(row, prev_col)).sub(Formula::num(1.0)),
+            Formula::cell(row, curr_col)
+                .div(Formula::cell(row, prev_col))
+                .sub(Formula::num(1.0)),
         );
         let var_pct = Formula::iferror(inner_if, Formula::str(""));
-        match if curr == 0.0 || prev == 0.0 { None } else { Some(curr / prev - 1.0) } {
+        match if curr == 0.0 || prev == 0.0 {
+            None
+        } else {
+            Some(curr / prev - 1.0)
+        } {
             Some(v) => sheet.write_formula_num_with_format(row, col_var_pct, var_pct, v, &pct_fmt),
             None => sheet.write_formula_str_with_format(row, col_var_pct, var_pct, "", &pct_fmt),
         };
@@ -187,10 +202,10 @@ fn write_summary_sheet(wb: &mut StreamingWorkbook<File>, records: &[Record]) {
     let last_data_row = row - 1;
     let totals_row = row;
     sheet.write_string_with_format(totals_row, 0, "TOTAL", &total_label_fmt);
-    for i in 0..n_months {
+    for (i, &sum_value) in month_sums.iter().enumerate() {
         let col = 1 + i as u32;
         let sum = Formula::sum_range(2, col, last_data_row, col);
-        sheet.write_formula_num_with_format(totals_row, col, sum, month_sums[i], &total_value_fmt);
+        sheet.write_formula_num_with_format(totals_row, col, sum, sum_value, &total_value_fmt);
     }
     let grand_total: f64 = month_sums.iter().sum();
     sheet.write_formula_num_with_format(

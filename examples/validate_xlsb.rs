@@ -12,7 +12,7 @@
 //!
 //! Run with: cargo run --example validate_xlsb -- <path.xlsb>
 
-use calamine::{open_workbook, Reader, Xlsb};
+use calamine::{Reader, Xlsb, open_workbook};
 use std::io::Read;
 use xlsb_write::biff12::try_parse_records;
 use zip::ZipArchive;
@@ -24,7 +24,9 @@ fn main() {
     println!("=== Structural check: every .bin part is a well-formed BIFF12 record stream ===");
     let file = std::fs::File::open(&path).expect("open file");
     let mut zip = ZipArchive::new(file).expect("open as zip");
-    let mut names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+    let mut names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
     names.sort();
 
     for name in &names {
@@ -45,7 +47,10 @@ fn main() {
 
     println!("\n=== Content_Types / worksheet part cross-check ===");
     let mut ct = String::new();
-    zip.by_name("[Content_Types].xml").expect("Content_Types missing").read_to_string(&mut ct).unwrap();
+    zip.by_name("[Content_Types].xml")
+        .expect("Content_Types missing")
+        .read_to_string(&mut ct)
+        .unwrap();
     for name in &names {
         if name.starts_with("xl/worksheets/sheet") && name.ends_with(".bin") {
             let part_name = format!("/{name}");

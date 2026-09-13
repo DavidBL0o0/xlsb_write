@@ -69,7 +69,9 @@ fn main() {
 
     let headers = ["Region", "Product", "Units", "Price", "Revenue"];
     for (i, name) in headers.iter().enumerate() {
-        sheet.write_string_with_format(0, i as u32, name, &header_fmt).expect("write header cell");
+        sheet
+            .write_string_with_format(0, i as u32, name, &header_fmt)
+            .expect("write header cell");
     }
 
     let mut rng = Rng(42);
@@ -82,10 +84,16 @@ fn main() {
 
         sheet.write_string(row, 0, region).expect("write region");
         sheet.write_string(row, 1, product).expect("write product");
-        sheet.write_number_with_format(row, 2, units, &int_fmt).expect("write units");
-        sheet.write_number_with_format(row, 3, price, &money_fmt).expect("write price");
+        sheet
+            .write_number_with_format(row, 2, units, &int_fmt)
+            .expect("write units");
+        sheet
+            .write_number_with_format(row, 3, price, &money_fmt)
+            .expect("write price");
         let formula = Formula::cell(row, 2).mul(Formula::cell(row, 3));
-        sheet.write_formula_num_with_format(row, 4, formula, revenue, &money_fmt).expect("write revenue formula");
+        sheet
+            .write_formula_num_with_format(row, 4, formula, revenue, &money_fmt)
+            .expect("write revenue formula");
     }
 
     sheet.finish().expect("finish Sales Ledger sheet");

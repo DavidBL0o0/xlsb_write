@@ -75,11 +75,16 @@ pub fn try_parse_records(data: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, String> {
     while pos < data.len() {
         let start = pos;
         let Some((rid, n)) = try_read_vi(data, pos) else {
-            return Err(format!("truncated rid varint at byte {start} (stream len {})", data.len()));
+            return Err(format!(
+                "truncated rid varint at byte {start} (stream len {})",
+                data.len()
+            ));
         };
         pos += n;
         let Some((rlen, n)) = try_read_vi(data, pos) else {
-            return Err(format!("truncated length varint at byte {pos} (record rid={rid} started at {start})"));
+            return Err(format!(
+                "truncated length varint at byte {pos} (record rid={rid} started at {start})"
+            ));
         };
         pos += n;
         let end = pos + rlen as usize;
@@ -144,7 +149,10 @@ pub fn pseudo_unique_16_bytes() -> [u8; 16] {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
 
     let mut out = [0u8; 16];
     for (i, salt) in [0xA5u8, 0x5Au8].into_iter().enumerate() {
@@ -165,13 +173,13 @@ pub fn encode_rk(v: f64) -> Option<u32> {
     }
     // Integer form: fInt=1 (bit1), fX100=0 (bit0)
     let iv = v as i64;
-    if iv as f64 == v && iv >= -(1 << 29) && iv < (1 << 29) {
+    if iv as f64 == v && (-(1 << 29)..(1 << 29)).contains(&iv) {
         return Some(((iv << 2) | 2) as u32);
     }
     // ×100 integer form: fInt=1, fX100=1
     let v100 = v * 100.0;
     let iv100 = v100.round() as i64;
-    if (v100 - iv100 as f64).abs() < 1e-6 && iv100 >= -(1 << 29) && iv100 < (1 << 29) {
+    if (v100 - iv100 as f64).abs() < 1e-6 && (-(1 << 29)..(1 << 29)).contains(&iv100) {
         return Some(((iv100 << 2) | 3) as u32);
     }
     // Double-top form: fInt=0, fX100=0. This form stores only the high 32
@@ -376,7 +384,10 @@ mod tests {
         for v in [0.1534, 0.1, 1.0 / 3.0, 12345.678, -0.02, 9.99] {
             if let Some(rk) = encode_rk(v) {
                 let decoded = decode_rk(rk);
-                assert!((decoded - v).abs() < 1e-9, "RK encoding of {v} was lossy: decoded as {decoded}");
+                assert!(
+                    (decoded - v).abs() < 1e-9,
+                    "RK encoding of {v} was lossy: decoded as {decoded}"
+                );
             }
         }
     }

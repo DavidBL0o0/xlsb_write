@@ -30,10 +30,26 @@
 use crate::biff12::{write_rec, write_wstr};
 
 /// Builtin function index (`Ftab`), from the published MS-XLS spec.
+///
+/// The constants below (`COUNT` through `ROUND`) are the only functions
+/// this crate's own test suite has verified byte-for-byte against real
+/// Excel output — use `Formula::Func` with one of them whenever possible.
+///
+/// The inner field is public so a caller who needs a function not listed
+/// here (`VLOOKUP`, `SUMIF`, string/date functions, ...) can construct
+/// `FnIndex(raw_ftab_index)` directly rather than forking this crate —
+/// but doing so is **unverified by this crate**: look the real index up
+/// in the published MS-XLS `Ftab` enumeration yourself (don't guess), and
+/// double-check `PtgFuncVar`'s `cparams` byte (written from
+/// `args.len()` in `Formula::Func`'s encoding) actually matches the
+/// function's real required argument count — a mismatch there is exactly
+/// the class of subtle bug this crate has hit before with its own
+/// built-in functions.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FnIndex(pub(crate) u16);
+pub struct FnIndex(pub u16);
 
 impl FnIndex {
+    /// Verified against real Excel output by this crate's own tests.
     pub const COUNT: FnIndex = FnIndex(0x0000);
     pub const ISNA: FnIndex = FnIndex(0x0002);
     pub const ISERROR: FnIndex = FnIndex(0x0003);
@@ -83,17 +99,28 @@ impl Formula {
         Formula::Str(s.to_owned())
     }
     pub fn sum_range(first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> Self {
-        Formula::Func(FnIndex::SUM, vec![Formula::range(first_row, first_col, last_row, last_col)])
+        Formula::Func(
+            FnIndex::SUM,
+            vec![Formula::range(first_row, first_col, last_row, last_col)],
+        )
     }
+    // `add`/`sub`/`mul`/`div` deliberately name-match `std::ops` (this is a
+    // formula-expression builder, not an arithmetic type — `Formula` isn't
+    // meant to implement `Add`/`Sub`/`Mul`/`Div` itself, so there's no
+    // actual trait-confusion risk despite the lint).
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, rhs: Formula) -> Self {
         Formula::Add(Box::new(self), Box::new(rhs))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, rhs: Formula) -> Self {
         Formula::Sub(Box::new(self), Box::new(rhs))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, rhs: Formula) -> Self {
         Formula::Mul(Box::new(self), Box::new(rhs))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, rhs: Formula) -> Self {
         Formula::Div(Box::new(self), Box::new(rhs))
     }
@@ -298,7 +325,10 @@ impl Formula {
 /// byte-for-byte against a real Excel-produced PtgStr in a reference file.
 fn write_short_xlunicode_string(s: &str, buf: &mut Vec<u8>) {
     let utf16: Vec<u16> = s.encode_utf16().collect();
-    debug_assert!(utf16.len() <= 255, "formula string literal too long for PtgStr (cch MUST be <= 255)");
+    debug_assert!(
+        utf16.len() <= 255,
+        "formula string literal too long for PtgStr (cch MUST be <= 255)"
+    );
     buf.extend_from_slice(&(utf16.len() as u16).to_le_bytes());
     for ch in &utf16 {
         buf.extend_from_slice(&ch.to_le_bytes());
@@ -400,7 +430,14 @@ mod tests {
         let rgce = Formula::str("hello").encode();
         assert_eq!(rgce[0], 0x17); // PtgStr
         assert_eq!(u16::from_le_bytes(rgce[1..3].try_into().unwrap()), 5); // cch, 2 bytes
-        assert_eq!(&rgce[3..13], "hello".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>().as_slice());
+        assert_eq!(
+            &rgce[3..13],
+            "hello"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<u8>>()
+                .as_slice()
+        );
         assert_eq!(rgce.len(), 1 + 2 + 2 * 5); // ptg + cch(2) + chars, no flags byte
     }
 

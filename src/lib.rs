@@ -28,7 +28,7 @@ use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::Path;
 use std::rc::Rc;
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 // ── Public value/error types ────────────────────────────────────────────────
 
@@ -165,10 +165,20 @@ impl Worksheet {
         let mut cells: Vec<(u32, &CellValue, u16)> =
             pending.cells.iter().map(|(col, val, xf)| (*col, val, *xf)).collect();
         cells.sort_by_key(|(col, _, _)| *col);
-        let (height_pt, hidden) =
-            self.row_specs.get(&pending.row).copied().unwrap_or((DEFAULT_ROW_HEIGHT_PT, false));
+        let (height_pt, hidden) = self
+            .row_specs
+            .get(&pending.row)
+            .copied()
+            .unwrap_or((DEFAULT_ROW_HEIGHT_PT, false));
         let height_twips = (height_pt * 20.0).round() as u16;
-        sheet::encode_row(pending.row, &cells, height_twips, hidden, &mut self.sst.borrow_mut(), &mut self.body);
+        sheet::encode_row(
+            pending.row,
+            &cells,
+            height_twips,
+            hidden,
+            &mut self.sst.borrow_mut(),
+            &mut self.body,
+        );
         self.last_flushed_row = Some(pending.row);
     }
 
@@ -177,11 +187,27 @@ impl Worksheet {
     /// given row must all be written before moving on to a later row.
     ///
     /// # Panics
-    /// If `row` is less than or equal to a row that's already been flushed
-    /// (or less than the currently-pending row) — this streaming writer
-    /// requires non-decreasing row order. Sort your data by row before
-    /// writing it.
+    /// - If `row`/`col` is at or past Excel's real per-worksheet ceiling
+    ///   (1,048,576 rows / 16,384 columns) — without this check, a caller
+    ///   feeding in oversized data would get a file this crate's own
+    ///   structural validator considers well-formed, but that a real reader
+    ///   (confirmed: `calamine`) silently truncates on read, with no error
+    ///   from this crate at all (found while measuring Round 6's streaming
+    ///   rewrite: a 6,000,000-row test dataset was silently cut down to
+    ///   1,048,577 rows on read).
+    /// - If `row` is less than or equal to a row that's already been flushed
+    ///   (or less than the currently-pending row) — this streaming writer
+    ///   requires non-decreasing row order. Sort your data by row before
+    ///   writing it.
     fn stage_cell(&mut self, row: u32, col: u32, value: CellValue, xf: u16) {
+        const MAX_ROW: u32 = 1_048_576;
+        const MAX_COL: u32 = 16_384;
+        assert!(
+            row < MAX_ROW && col < MAX_COL,
+            "xlsb_write: cell ({row},{col}) is outside Excel's real worksheet limits \
+             (0..{MAX_ROW} rows x 0..{MAX_COL} columns) — a real reader will not display \
+             rows/columns past this ceiling even though this crate can encode them."
+        );
         let starting_new_row = !matches!(&self.pending_row, Some(p) if p.row == row);
         if starting_new_row {
             let floor = self.pending_row.as_ref().map(|p| p.row).or(self.last_flushed_row);
@@ -195,7 +221,10 @@ impl Worksheet {
                 );
             }
             self.flush_pending_row();
-            self.pending_row = Some(PendingRow { row, cells: vec![(col, value, xf)] });
+            self.pending_row = Some(PendingRow {
+                row,
+                cells: vec![(col, value, xf)],
+            });
         } else if let Some(p) = &mut self.pending_row {
             if let Some(existing) = p.cells.iter_mut().find(|(c, _, _)| *c == col) {
                 existing.1 = value;
@@ -293,7 +322,12 @@ impl Worksheet {
         fmt: &Format,
     ) -> &mut Self {
         let xf = self.resolve_format(fmt);
-        self.stage_cell(row, col, CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()), xf);
+        self.stage_cell(
+            row,
+            col,
+            CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()),
+            xf,
+        );
         self
     }
 
@@ -319,7 +353,11 @@ impl Worksheet {
 
     /// Hide a column. Keeps any width previously set with `set_column_width`.
     pub fn set_column_hidden(&mut self, col: u32) -> &mut Self {
-        let width = self.col_specs.get(&col).map(|&(w, _)| w).unwrap_or(DEFAULT_COLUMN_WIDTH);
+        let width = self
+            .col_specs
+            .get(&col)
+            .map(|&(w, _)| w)
+            .unwrap_or(DEFAULT_COLUMN_WIDTH);
         self.col_specs.insert(col, (width, true));
         self
     }
@@ -360,7 +398,11 @@ impl Worksheet {
     /// `check_row_not_flushed`.
     pub fn set_row_hidden(&mut self, row: u32) -> &mut Self {
         self.check_row_not_flushed(row, "set_row_hidden");
-        let height = self.row_specs.get(&row).map(|&(h, _)| h).unwrap_or(DEFAULT_ROW_HEIGHT_PT);
+        let height = self
+            .row_specs
+            .get(&row)
+            .map(|&(h, _)| h)
+            .unwrap_or(DEFAULT_ROW_HEIGHT_PT);
         self.row_specs.insert(row, (height, true));
         self
     }
@@ -394,8 +436,11 @@ fn finish_and_write_sheet<W: Write + Seek>(
 ) -> Result<(), WriteError> {
     sheet.flush_pending_row(); // encode whatever row was still open
 
-    let col_specs: Vec<sheet::ColSpec> =
-        sheet.col_specs.iter().map(|(&col, &(w, hidden))| (col, w, hidden)).collect();
+    let col_specs: Vec<sheet::ColSpec> = sheet
+        .col_specs
+        .iter()
+        .map(|(&col, &(w, hidden))| (col, w, hidden))
+        .collect();
 
     // Header and footer are small (well under 1KB plus one BrtColInfo/
     // BrtMergeCell per entry) — only `sheet.body` can be large (one entry
@@ -403,7 +448,14 @@ fn finish_and_write_sheet<W: Write + Seek>(
     // the zip stream directly rather than copied into a combined buffer
     // first, which would transiently double this sheet's peak memory.
     let mut header = Vec::with_capacity(512);
-    sheet::write_sheet_header(sheet.freeze_row, sheet.freeze_col, &col_specs, sheet.dim, active, &mut header);
+    sheet::write_sheet_header(
+        sheet.freeze_row,
+        sheet.freeze_col,
+        &col_specs,
+        sheet.dim,
+        active,
+        &mut header,
+    );
     let mut footer = Vec::new();
     sheet::write_sheet_footer(&sheet.merges, &mut footer);
 
@@ -429,7 +481,11 @@ impl Workbook {
     }
 
     pub fn add_worksheet(&mut self, name: &str) -> &mut Worksheet {
-        self.sheets.push(Worksheet::new(name, Rc::clone(&self.sst), Rc::clone(&self.style_builder)));
+        self.sheets.push(Worksheet::new(
+            name,
+            Rc::clone(&self.sst),
+            Rc::clone(&self.style_builder),
+        ));
         self.sheets.last_mut().unwrap()
     }
 
@@ -603,7 +659,11 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
              new_worksheet_sized(\"{}\", {}, {}) — this sized-streaming sheet already sent a header \
              promising that bound, so a cell outside it can't be accommodated. Pass a larger \
              last_row/last_col if the real data can exceed what you declared.",
-            self.last_row, self.last_col, self.inner.name, self.last_row, self.last_col,
+            self.last_row,
+            self.last_col,
+            self.inner.name,
+            self.last_row,
+            self.last_col,
         );
     }
 
@@ -627,8 +687,12 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
     /// Called at most once, the first time a row is flushed (or, for a
     /// sheet with zero or one rows, from `finish`).
     fn write_header(&mut self) -> Result<(), WriteError> {
-        let col_specs: Vec<sheet::ColSpec> =
-            self.inner.col_specs.iter().map(|(&col, &(w, hidden))| (col, w, hidden)).collect();
+        let col_specs: Vec<sheet::ColSpec> = self
+            .inner
+            .col_specs
+            .iter()
+            .map(|(&col, &(w, hidden))| (col, w, hidden))
+            .collect();
         let dim = Some((0, self.last_row, 0, self.last_col));
 
         let mut header = Vec::with_capacity(512);
@@ -641,7 +705,8 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
             &mut header,
         );
 
-        self.zip.start_file(format!("xl/worksheets/sheet{}.bin", self.number), zip_options())?;
+        self.zip
+            .start_file(format!("xl/worksheets/sheet{}.bin", self.number), zip_options())?;
         self.zip.write_all(&header)?;
         self.header_written = true;
         Ok(())
@@ -683,13 +748,7 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
     pub fn write_number(&mut self, row: u32, col: u32, value: f64) -> Result<(), WriteError> {
         self.write_number_with_format(row, col, value, &Format::default())
     }
-    pub fn write_number_with_format(
-        &mut self,
-        row: u32,
-        col: u32,
-        value: f64,
-        fmt: &Format,
-    ) -> Result<(), WriteError> {
+    pub fn write_number_with_format(&mut self, row: u32, col: u32, value: f64, fmt: &Format) -> Result<(), WriteError> {
         self.check_bounds(row, col);
         let xf = self.inner.resolve_format(fmt);
         self.inner.stage_cell(row, col, CellValue::Number(value), xf);
@@ -744,7 +803,8 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
     ) -> Result<(), WriteError> {
         self.check_bounds(row, col);
         let xf = self.inner.resolve_format(fmt);
-        self.inner.stage_cell(row, col, CellValue::FormulaNum(Box::new(formula), cached_value), xf);
+        self.inner
+            .stage_cell(row, col, CellValue::FormulaNum(Box::new(formula), cached_value), xf);
         self.drain_flushed_row()
     }
 
@@ -768,7 +828,12 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
     ) -> Result<(), WriteError> {
         self.check_bounds(row, col);
         let xf = self.inner.resolve_format(fmt);
-        self.inner.stage_cell(row, col, CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()), xf);
+        self.inner.stage_cell(
+            row,
+            col,
+            CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()),
+            xf,
+        );
         self.drain_flushed_row()
     }
 
@@ -887,12 +952,7 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
     /// lifetime, so the borrow checker enforces "finish this sheet before
     /// starting another" — the same rule `StreamingWorksheet` only documents
     /// as a convention (see `finish_worksheet`'s doc comment).
-    pub fn new_worksheet_sized(
-        &mut self,
-        name: &str,
-        last_row: u32,
-        last_col: u32,
-    ) -> SizedStreamingWorksheet<'_, W> {
+    pub fn new_worksheet_sized(&mut self, name: &str, last_row: u32, last_col: u32) -> SizedStreamingWorksheet<'_, W> {
         self.sheet_names.push(name.to_owned());
         let number = self.sheet_names.len();
         let active = number == 1;
