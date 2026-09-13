@@ -52,6 +52,12 @@ pub enum CellValue {
     FormulaNum(Box<Formula>, f64),
     /// A formula whose most recent evaluation produced a string value.
     FormulaStr(Box<Formula>, String),
+    /// A formula whose most recent evaluation produced a boolean value
+    /// (`AND`/`OR`/`NOT`, or a bare comparison used as the whole formula).
+    /// Written as `BrtFmlaBool`, not `BrtFmlaNum` — real Excel's own
+    /// encoding for these, confirmed byte-for-byte (see
+    /// `formula::write_fmla_bool`'s doc comment).
+    FormulaBool(Box<Formula>, bool),
 }
 
 #[derive(Debug)]
@@ -346,6 +352,25 @@ impl Worksheet {
             CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()),
             xf,
         );
+        self
+    }
+
+    /// Write a formula whose most recent evaluation produced a boolean
+    /// value (`AND`/`OR`/`NOT`, or a bare comparison used as the whole
+    /// formula). Same cached-value contract as `write_formula_num`.
+    pub fn write_formula_bool(&mut self, row: u32, col: u32, formula: Formula, cached_value: bool) -> &mut Self {
+        self.write_formula_bool_with_format(row, col, formula, cached_value, &Format::default())
+    }
+    pub fn write_formula_bool_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: bool,
+        fmt: &Format,
+    ) -> &mut Self {
+        let xf = self.resolve_format(fmt);
+        self.stage_cell(row, col, CellValue::FormulaBool(Box::new(formula), cached_value), xf);
         self
     }
 
@@ -1040,6 +1065,31 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
             CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()),
             xf,
         );
+        self.drain_flushed_row()
+    }
+
+    /// See `Worksheet::write_formula_bool`.
+    pub fn write_formula_bool(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: bool,
+    ) -> Result<(), WriteError> {
+        self.write_formula_bool_with_format(row, col, formula, cached_value, &Format::default())
+    }
+    pub fn write_formula_bool_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: bool,
+        fmt: &Format,
+    ) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        self.inner
+            .stage_cell(row, col, CellValue::FormulaBool(Box::new(formula), cached_value), xf);
         self.drain_flushed_row()
     }
 

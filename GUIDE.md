@@ -561,12 +561,14 @@ Formula::cell(row, col)                              // a single-cell reference
 Formula::range(r0, c0, r1, c1)                        // a rectangular range
 Formula::num(3.14)                                    // a numeric literal
 Formula::str("hello")                                 // a string literal
+Formula::boolean(true)                                // a boolean literal (PtgBool)
 
 // arithmetic (all consume self, return a new Formula — chain freely)
 a.add(b)   // a + b
 a.sub(b)   // a - b
 a.mul(b)   // a * b
 a.div(b)   // a / b
+a.concat(b) // a & b (string concatenation)
 
 // comparisons
 a.lt(b)  a.le(b)  a.eq(b)  a.ge(b)  a.gt(b)  a.ne(b)
@@ -579,6 +581,18 @@ Formula::sum_range(first_row, first_col, last_row, last_col)
 // branching
 Formula::if_then_else(cond, then, else_)              // IF(cond, then, else)
 Formula::iferror(expr, default)                       // IFERROR(expr, default)
+
+// string, logical, conditional-aggregate, text, date, and lookup
+// functions — see "More built-in functions" below.
+Formula::concatenate(vec![a, b, c])                   // CONCATENATE(a, b, c)
+Formula::and(vec![a, b])   Formula::or(vec![a, b])   Formula::not(a)
+Formula::sumif(range, criteria)   Formula::countif(range, criteria)
+Formula::left(text, n)   Formula::right(text, n)   Formula::mid(text, start, n)
+Formula::len(text)   Formula::text(value, format_code)
+Formula::today()   Formula::now()   Formula::date(year, month, day)
+Formula::vlookup(lookup_value, table, col_index, exact_match)
+Formula::index(array, row_num, col_num)
+Formula::match_(lookup_value, array, match_type)      // trailing `_`: `match` is a keyword
 ```
 
 Example — `(A1 + 5) * 2`:
@@ -593,7 +607,15 @@ sheet.write_formula_num(row, col, f, computed_value);
 ```rust
 sheet.write_formula_num(row, col, formula, cached_value: f64);
 sheet.write_formula_str(row, col, formula, cached_value: &str);
+sheet.write_formula_bool(row, col, formula, cached_value: bool);
 ```
+
+Use `write_formula_bool` for a formula whose result is a boolean —
+`AND`/`OR`/`NOT`, or a bare comparison (`a.gt(b)`) used as the whole
+formula. Real Excel writes these as a distinct record type (`BrtFmlaBool`,
+with a 1-byte cached value) rather than `BrtFmlaNum`'s 8-byte float, and
+this crate matches that — confirmed byte-for-byte against real Excel's own
+`=AND(...)` output.
 
 `cached_value` is what's displayed **immediately**, before any
 recalculation happens. Excel itself recalculates on open (so a wrong
@@ -611,22 +633,34 @@ every formula's cached value is computed in plain Rust alongside the
 
 ```rust
 FnIndex::COUNT, FnIndex::ISNA, FnIndex::ISERROR,
-FnIndex::SUM, FnIndex::AVERAGE, FnIndex::MIN, FnIndex::MAX, FnIndex::ROUND
+FnIndex::SUM, FnIndex::AVERAGE, FnIndex::MIN, FnIndex::MAX, FnIndex::ROUND,
+FnIndex::CONCATENATE, FnIndex::AND, FnIndex::OR, FnIndex::NOT,
+FnIndex::SUMIF, FnIndex::COUNTIF,
+FnIndex::LEFT, FnIndex::RIGHT, FnIndex::MID, FnIndex::LEN, FnIndex::TEXT,
+FnIndex::TODAY, FnIndex::NOW, FnIndex::DATE,
+FnIndex::VLOOKUP, FnIndex::INDEX, FnIndex::MATCH
 ```
 
 These are the only function indices this crate's own test suite has
-verified byte-for-byte against real Excel output — use one of them via
-`Formula::Func(FnIndex::SUM, args)` whenever possible.
+verified against real Excel output — use one of them via `Formula::Func`/
+`Formula::FuncFixed` (or, better, the dedicated `Formula::and`/
+`Formula::sumif`/... constructors below) whenever possible.
 
-For a function not listed here (`VLOOKUP`, `SUMIF`, text/date functions,
-...), `FnIndex`'s inner value is public: `Formula::Func(FnIndex(0x0182),
-vec![...])` works without forking this crate. This is **unverified by
-this crate** — look the real index up yourself in the published MS-XLS
-`Ftab` enumeration (don't guess), and double-check the argument count you
-pass matches what the function actually requires (`PtgFuncVar`'s
-`cparams` byte is written from `args.len()` — a mismatch there is exactly
-the class of subtle bug this crate has hit before with its own built-in
-functions).
+For a function not listed here, `FnIndex`'s inner value is public:
+`Formula::Func(FnIndex(0x0182), vec![...])` works without forking this
+crate. This is **unverified by this crate** — look the real index up
+yourself in the published MS-XLS `Ftab` enumeration (don't guess), and
+double-check both the argument count (`PtgFuncVar`'s `cparams` byte is
+written from `args.len()`) **and** whether real Excel actually uses the
+general `PtgFuncVar` form at all: some functions (`NOT`, `COUNTIF`, `MID`,
+`LEN`, `TEXT`, `DATE`, ...) are *fixed*-argument-count in real Excel and
+are encoded with the narrower `PtgFunc` form instead (no `cparams` byte).
+Guessing wrong on either point is exactly the class of subtle bug this
+crate has hit before with its own built-in functions — see
+`src/formula.rs`'s `Formula::Func`/`Formula::FuncFixed` doc comments for
+exactly which of the functions below are which, and why argument count
+alone doesn't tell you (`SUMIF` and `COUNTIF` both commonly take 2 args,
+but only `COUNTIF`'s is fixed).
 
 **Use `Formula::sum_range` for a single-range `SUM`, not a hand-built
 `Formula::Func`.** A single-range `SUM` is the one case real Excel encodes
@@ -636,6 +670,106 @@ against real Excel output. Using the general form is spec-legal and opens
 fine, but was found (during this crate's own hardening) to make Excel's
 dynamic-array engine insert a spurious `@` into the formula on load. Stick
 to the provided constructor and you won't hit this.
+
+### More built-in functions
+
+Every constructor below was checked against real Excel output the same
+way `SUM`/`IF`/`IFERROR` were: build a tiny reference `.xlsb` with real
+Excel via COM automation, then compare this crate's encoding byte-for-byte
+against Excel's own `Rgce` bytes for the equivalent formula (via
+`examples/dump_sheet.rs`/`examples/rgce_disasm.rs`).
+
+**String concatenation:**
+
+```rust
+a.concat(b)                          // a & b — PtgConcat, a new binary infix Ptg
+Formula::concatenate(vec![a, b, c])  // CONCATENATE(a, b, c) — variadic function
+```
+
+Prefer `a.concat(b)` for two values (one token shorter, and what Excel's
+own UI produces for `=A1&B1`); use `concatenate` for 3+ values or to match
+literal `CONCATENATE(...)` formula text.
+
+**Logical functions:**
+
+```rust
+Formula::and(vec![cond1, cond2, ...])  // AND(...) — variadic
+Formula::or(vec![cond1, cond2, ...])   // OR(...) — variadic
+Formula::not(cond)                     // NOT(cond)
+```
+
+`AND`/`OR`/`NOT` (and any bare comparison used as a whole formula) produce
+a **boolean** result — write them with `write_formula_bool`, not
+`write_formula_num`.
+
+**Conditional aggregates:**
+
+```rust
+Formula::sumif(range, criteria)     // SUMIF(range, criteria) — 2-arg form
+Formula::countif(range, criteria)   // COUNTIF(range, criteria) — always 2 args
+```
+
+`criteria` is a normal `Formula` — a comparison-expression string
+(`Formula::str(">10")`), a plain value to match (`Formula::str("apples")`,
+`Formula::num(10.0)`), etc.; real Excel encodes it as a plain string/number
+literal, nothing special. `SUMIF` also has a 3-arg form
+(`SUMIF(range, criteria, sum_range)`, to total a *different* column than
+the one being matched) — not wrapped in its own constructor, but reachable
+directly (and separately byte-verified) via
+`Formula::Func(FnIndex::SUMIF, vec![range, criteria, sum_range])`.
+
+**Text functions:**
+
+```rust
+Formula::left(text, num_chars)             // LEFT(text, num_chars)
+Formula::right(text, num_chars)            // RIGHT(text, num_chars)
+Formula::mid(text, start_num, num_chars)   // MID(text, start_num, num_chars)
+Formula::len(text)                         // LEN(text)
+Formula::text(value, format_text)          // TEXT(value, format_text)
+```
+
+`format_text` (e.g. `Formula::str("0.00")`) is a plain string literal, same
+as everywhere else — but note that Excel evaluates number-format codes
+using the **current user's regional settings** for the decimal/thousands
+separator characters (`.`/`,`); a format code written with US-style `.`
+can render unexpectedly on a machine set to a locale that uses `,` as the
+decimal separator. This is a general Excel behavior, not something this
+crate's encoding controls or can compensate for — the bytes written are
+exactly what real Excel itself writes for the same format string.
+
+**Date functions:**
+
+```rust
+Formula::today()                        // TODAY() — no arguments
+Formula::now()                          // NOW() — no arguments
+Formula::date(year, month, day)         // DATE(year, month, day)
+```
+
+`TODAY`/`NOW` are **volatile**: real Excel recalculates them on every
+calculation pass, not just when a dependency changes, because a formula
+with no cell references would otherwise never be flagged for
+recalculation. This crate reproduces both halves of how real Excel marks
+that: a `PtgAttrSemi` token wrapping the call, and a bit set in the cell
+record's `grbitFlags` (`Formula::is_volatile()` detects this
+automatically — you don't need to do anything beyond using `today()`/
+`now()`). `DATE(...)` is an ordinary, non-volatile function.
+
+**Lookup functions:**
+
+```rust
+Formula::vlookup(lookup_value, table_array, col_index_num, range_lookup: bool)
+Formula::index(array, row_num, column_num)
+Formula::match_(lookup_value, lookup_array, match_type)   // `match` is a keyword, hence `match_`
+```
+
+`vlookup`'s 4th argument is a plain Rust `bool` (encoded as `Formula::Bool`
+— `PtgBool`, confirmed byte-for-byte against real Excel's own
+`VLOOKUP(...,FALSE)`), covering the overwhelmingly common case of a
+literal `TRUE`/`FALSE`; build `Formula::Func(FnIndex::VLOOKUP, vec![...])`
+directly if you need a computed 4th argument instead. `index`/`match_`
+cover the common 2-4/2-3-arg forms real Excel itself uses; `INDEX`'s rarer
+1-arg area-only form and 4-arg `area_num` form aren't wrapped in their own
+constructor but are reachable the same way.
 
 ### `IF` / `IFERROR` semantics
 
@@ -704,6 +838,13 @@ runnable, from-scratch example exercising nearly everything in this guide
 at once: synthetic data generation, two sheets, colored/bold headers,
 borders, column widths, frozen panes (rows and columns), a merged banner
 cell, and a full SUM/IF/IFERROR variance table.
+
+See [`examples/formula_functions_demo.rs`](examples/formula_functions_demo.rs)
+for a runnable demo of every function added in the 2026-09-13
+formula-coverage expansion (`&`/`CONCATENATE`, `AND`/`OR`/`NOT`,
+`SUMIF`/`COUNTIF` including the 3-arg form, `LEFT`/`RIGHT`/`MID`/`LEN`/
+`TEXT`, `TODAY`/`NOW`/`DATE`, `VLOOKUP`/`INDEX`/`MATCH`), each with a
+hand-computed cached value next to it.
 
 ```
 cargo run --example sales_report
@@ -872,6 +1013,47 @@ images, `calamine` is a cell-data reader and doesn't surface autofilter at
 all — so `tests/autofilter.rs` checks the structural shape (the exact
 `BrtBeginAFilter` payload and position) instead, and the real-Excel-COM
 check above is what actually proves correctness for that feature.
+
+**Formula-coverage expansion specifically** (`&`/`CONCATENATE`, `AND`/`OR`/
+`NOT`, `SUMIF`/`COUNTIF`, `LEFT`/`RIGHT`/`MID`/`LEN`/`TEXT`, `TODAY`/`NOW`/
+`DATE`, `VLOOKUP`/`INDEX`/`MATCH`, 2026-09-13): every `Ftab` index was
+cross-checked against Apache POI's `functionMetadata.txt` (a
+long-established, independently-maintained mapping of Excel's built-in
+function table) and then confirmed byte-for-byte against a real
+Excel-authored `.xlsb` — this session built one via COM automation
+(`Range.Formula = "=AND(...)"` etc. for all eighteen new functions in one
+pass, `SaveAs` format 50) and disassembled every formula cell's raw `Rgce`
+bytes with `examples/dump_sheet.rs`/`examples/rgce_disasm.rs` (the latter's
+own `PtgStr` decoding was found to still have the stale 1-byte-cch BIFF8
+shape from before this crate's own `PtgStr` fix, and was corrected in the
+same pass). This is how three non-obvious facts were discovered, none of
+which could have been safely guessed from the spec or from argument count
+alone: `PtgConcat` (`&`) is a plain binary infix Ptg, no different in shape
+from `PtgAdd`; some functions (`NOT`, `COUNTIF`, `MID`, `LEN`, `TEXT`,
+`DATE`, `TODAY`, `NOW`) are fixed-argument-count in real Excel and use the
+narrower `PtgFunc` form instead of `PtgFuncVar` (`COUNTIF` and `SUMIF` both
+commonly take 2 args, but only `COUNTIF`'s is fixed — this really did
+require checking each function's actual bytes, not just picking one and
+assuming the rest matched); and `TODAY`/`NOW` are volatile, requiring both
+a `PtgAttrSemi` wrapper token and a cell-record `grbitFlags` bit this crate
+would otherwise never emit (without which Excel has no reason to ever
+recalculate a formula with no cell dependencies). `SUMIF`'s 3-arg form and
+`VLOOKUP`'s `PtgBool` argument were each separately confirmed against their
+own real-Excel reference formula, not assumed from the 2-arg/plain-value
+cases. Every function is also covered by `tests/roundtrip.rs`'s
+`roundtrip_new_formula_functions_through_calamine`/
+`roundtrip_volatile_functions_through_calamine` (independent-reader
+value-level checks) and was verified via COM automation on the actual
+`.xlsb` this crate produces (`examples/formula_functions_demo.rs`): opens
+with no repair prompt, every formula bar shows the expected formula text,
+and Excel's own live recalculation matches every hand-computed value
+except one locale-specific display quirk — `TEXT(value,"$0.00")` rendered
+oddly on the Spanish-locale Excel installation used for this check (a
+general Excel behavior where number-format codes are interpreted using the
+current regional decimal/thousands-separator settings, not something this
+crate's byte encoding controls; the underlying `PtgStr("$0.00")` bytes
+match real Excel's own output exactly, confirmed separately by direct
+disassembly).
 
 ## Limitations — what's not supported
 

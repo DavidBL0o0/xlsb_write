@@ -47,11 +47,28 @@ fn main() {
                 println!("{start:3}: PtgInt  op={op:#04x} v={v}  size=3");
                 i += 3;
             }
+            0x1d => {
+                let v = bytes[i + 1];
+                println!("{start:3}: PtgBool op={op:#04x} v={v}  size=2");
+                i += 2;
+            }
             0x17 => {
-                let cch = bytes[i + 1] as usize;
-                let flag = bytes[i + 2];
+                // XLSB's PtgStr (2.5.98.88) is cch:2 bytes + rgch — NOT the
+                // classic BIFF8 ShortXLUnicodeString (cch:1 + flags:1 +
+                // chars) this used to assume. See formula.rs's module doc
+                // comment / `write_short_xlunicode_string` for the bug this
+                // mismatch caused (a shifted, garbage-length read) when this
+                // crate got it wrong the same way.
+                let cch = u16::from_le_bytes(bytes[i + 1..i + 3].try_into().unwrap()) as usize;
+                let chars: String = (0..cch)
+                    .map(|k| {
+                        let off = i + 3 + 2 * k;
+                        u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap())
+                    })
+                    .map(|u| char::from_u32(u as u32).unwrap_or('?'))
+                    .collect();
                 let size = 3 + 2 * cch;
-                println!("{start:3}: PtgStr  op={op:#04x} cch={cch} flag={flag:#04x}  size={size}");
+                println!("{start:3}: PtgStr  op={op:#04x} cch={cch} text={chars:?}  size={size}");
                 i += size;
             }
             0x03..=0x0e => {

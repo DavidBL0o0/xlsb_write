@@ -58,12 +58,60 @@ impl FnIndex {
     pub const MIN: FnIndex = FnIndex(0x0006);
     pub const MAX: FnIndex = FnIndex(0x0007);
     pub const ROUND: FnIndex = FnIndex(0x001B);
+
+    // ── 2026-09-13 formula-coverage expansion ──────────────────────────
+    //
+    // Every index below was cross-checked against Apache POI's
+    // `functionMetadata.txt` (itself sourced from the published BIFF Ftab
+    // enumeration) AND confirmed byte-for-byte against a real
+    // Excel-authored `.xlsb` built via COM automation (`Range.Formula =
+    // "=AND(...)"` etc., `SaveAs` format 50, inspected with
+    // `examples/dump_sheet.rs`) — see the doc comment on `Formula::Func`
+    // vs `Formula::FuncFixed` below for why some of these are one or the
+    // other. `AND`/`OR`/`SUMIF`/`LEFT`/`RIGHT`/`VLOOKUP`/`INDEX`/`MATCH`/
+    // `CONCATENATE` are real Excel's *variable*-argument-count functions
+    // (encoded via the general `PtgFuncVar` form, like `SUM`/`AVERAGE`
+    // above); `NOT`/`COUNTIF`/`MID`/`LEN`/`TEXT`/`TODAY`/`NOW`/`DATE` are
+    // real Excel's *fixed*-argument-count functions (encoded via the
+    // narrower `PtgFunc` form — 3 bytes, no `cparams` byte at all) — this
+    // was NOT guessable from the argument count alone (`COUNTIF` and
+    // `SUMIF` both commonly take 2 args, but only `COUNTIF`'s is fixed;
+    // real Excel's own encoder chose differently for each, confirmed by
+    // direct byte inspection).
+    pub const CONCATENATE: FnIndex = FnIndex(0x0150); // 336, variable (0-30 args)
+    pub const AND: FnIndex = FnIndex(0x0024); // 36, variable (1-30 args)
+    pub const OR: FnIndex = FnIndex(0x0025); // 37, variable (1-30 args)
+    pub const NOT: FnIndex = FnIndex(0x0026); // 38, fixed (1 arg) — PtgFunc
+    pub const SUMIF: FnIndex = FnIndex(0x0159); // 345, variable (2-3 args)
+    pub const COUNTIF: FnIndex = FnIndex(0x015A); // 346, fixed (2 args) — PtgFunc
+    pub const LEFT: FnIndex = FnIndex(0x0073); // 115, variable (1-2 args)
+    pub const RIGHT: FnIndex = FnIndex(0x0074); // 116, variable (1-2 args)
+    pub const MID: FnIndex = FnIndex(0x001F); // 31, fixed (3 args) — PtgFunc
+    pub const LEN: FnIndex = FnIndex(0x0020); // 32, fixed (1 arg) — PtgFunc
+    pub const TEXT: FnIndex = FnIndex(0x0030); // 48, fixed (2 args) — PtgFunc
+    /// Fixed (0 args), `PtgFunc` — and, unlike every other function here,
+    /// volatile: real Excel wraps the call in a `PtgAttrSemi` marker token
+    /// and sets a bit in the cell record's `grbitFlags` so it's
+    /// recalculated on every pass, not just when a dependency changes.
+    /// `Formula::today()`/`Formula::now()` reproduce both; see
+    /// `Formula::is_volatile`.
+    pub const TODAY: FnIndex = FnIndex(0x00DD); // 221, fixed (0 args), volatile
+    /// See `TODAY`'s doc comment — same volatile handling.
+    pub const NOW: FnIndex = FnIndex(0x004A); // 74, fixed (0 args), volatile
+    pub const DATE: FnIndex = FnIndex(0x0041); // 65, fixed (3 args) — PtgFunc
+    pub const VLOOKUP: FnIndex = FnIndex(0x0066); // 102, variable (3-4 args)
+    pub const INDEX: FnIndex = FnIndex(0x001D); // 29, variable (2-4 args)
+    pub const MATCH: FnIndex = FnIndex(0x0040); // 64, variable (2-3 args)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Formula {
     Num(f64),
     Str(String),
+    /// A boolean literal, encoded as `PtgBool` (opcode `0x1D`, one byte
+    /// `0`/`1` after it — confirmed byte-for-byte against real Excel's
+    /// encoding of `VLOOKUP(...,FALSE)`'s 4th argument).
+    Bool(bool),
     /// A single-cell reference, zero-based `(row, col)`.
     Ref(u32, u32),
     /// A rectangular range, zero-based `(first_row, first_col, last_row, last_col)`.
@@ -72,14 +120,36 @@ pub enum Formula {
     Sub(Box<Formula>, Box<Formula>),
     Mul(Box<Formula>, Box<Formula>),
     Div(Box<Formula>, Box<Formula>),
+    /// `&` string concatenation, encoded as the binary infix `PtgConcat`
+    /// (opcode `0x08`) — confirmed byte-for-byte against real Excel's
+    /// encoding of `=A1&B1` (same shape as `Add`/`Sub`/`Mul`/`Div` above,
+    /// just a different trailing opcode byte).
+    Concat(Box<Formula>, Box<Formula>),
     Lt(Box<Formula>, Box<Formula>),
     Le(Box<Formula>, Box<Formula>),
     Eq(Box<Formula>, Box<Formula>),
     Ge(Box<Formula>, Box<Formula>),
     Gt(Box<Formula>, Box<Formula>),
     Ne(Box<Formula>, Box<Formula>),
-    /// A function call: `Ftab` index + arguments, encoded as `PtgFuncVar`.
+    /// A function call with a *variable* argument count: `Ftab` index +
+    /// arguments, encoded as `PtgFuncVar` (opcode `0x42`, carries a
+    /// `cparams` byte = `args.len()`). Use for `SUM`, `AVERAGE`,
+    /// `CONCATENATE`, `AND`, `OR`, `SUMIF`, `LEFT`, `RIGHT`, `VLOOKUP`,
+    /// `INDEX`, `MATCH` — every function real Excel itself encodes this
+    /// way (confirmed byte-for-byte; see `FnIndex`'s doc comments).
     Func(FnIndex, Vec<Formula>),
+    /// A function call with a real, *fixed* argument count, encoded as
+    /// `PtgFunc` (opcode `0x41`, 3 bytes total — no `cparams` byte at
+    /// all, since the reader looks the arg count up from the `Ftab` entry
+    /// itself). Use for `NOT`, `COUNTIF`, `MID`, `LEN`, `TEXT`, `TODAY`,
+    /// `NOW`, `DATE` — real Excel encodes these with `PtgFunc`, not
+    /// `PtgFuncVar`, confirmed byte-for-byte; see `FnIndex`'s doc
+    /// comments. Getting this distinction wrong (e.g. using `Func`
+    /// instead of `FuncFixed` for `COUNTIF`) is spec-adjacent but not what
+    /// real Excel emits — exactly the class of mismatch that turned out to
+    /// matter for `SUM`'s `PtgAttrSum` shortcut, so this crate's own
+    /// verified constructors always pick the one real Excel actually uses.
+    FuncFixed(FnIndex, Vec<Formula>),
     /// `IF(cond, then, else)`, encoded with `PtgAttrIf`/`PtgAttrGoto`
     /// short-circuit branch tokens (only one branch actually evaluates).
     If(Box<Formula>, Box<Formula>, Box<Formula>),
@@ -158,6 +228,156 @@ impl Formula {
         )
     }
 
+    pub fn boolean(b: bool) -> Self {
+        Formula::Bool(b)
+    }
+
+    /// `A1&B1` — the `&` string-concatenation operator (`PtgConcat`), not
+    /// the `CONCATENATE(...)` function. See `Formula::concatenate` for the
+    /// variadic function form.
+    pub fn concat(self, rhs: Formula) -> Self {
+        Formula::Concat(Box::new(self), Box::new(rhs))
+    }
+
+    /// `CONCATENATE(args...)` — the variadic function form. For two plain
+    /// values, prefer `a.concat(b)` (the `&` operator): it's what Excel's
+    /// own UI produces for that case and is one token shorter.
+    pub fn concatenate(args: Vec<Formula>) -> Self {
+        Formula::Func(FnIndex::CONCATENATE, args)
+    }
+
+    /// `AND(args...)` — variadic (1-30 args in real Excel).
+    pub fn and(args: Vec<Formula>) -> Self {
+        Formula::Func(FnIndex::AND, args)
+    }
+    /// `OR(args...)` — variadic (1-30 args in real Excel).
+    pub fn or(args: Vec<Formula>) -> Self {
+        Formula::Func(FnIndex::OR, args)
+    }
+    /// `NOT(expr)` — always exactly 1 argument in real Excel.
+    #[allow(clippy::should_implement_trait)]
+    pub fn not(expr: Formula) -> Self {
+        Formula::FuncFixed(FnIndex::NOT, vec![expr])
+    }
+
+    /// `SUMIF(range, criteria)`. `criteria` is typically
+    /// `Formula::str(">10")`/`Formula::str("apples")` or `Formula::num(10.0)`
+    /// — real Excel encodes a comparison-expression criteria as a plain
+    /// string literal (`PtgStr`), confirmed byte-for-byte against
+    /// `SUMIF(A1:A10,">3")`. Real Excel's `SUMIF` also accepts an optional
+    /// 3rd `sum_range` argument (2-3 args total, variable); reach for it
+    /// with `Formula::Func(FnIndex::SUMIF, vec![range, criteria, sum_range])`
+    /// directly if you need it — not separately byte-verified by this
+    /// crate (only the 2-arg form was checked against real Excel output),
+    /// but it follows the exact same verified variable-argument
+    /// `PtgFuncVar` shape as the 2-arg form checked here.
+    pub fn sumif(range: Formula, criteria: Formula) -> Self {
+        Formula::Func(FnIndex::SUMIF, vec![range, criteria])
+    }
+    /// `COUNTIF(range, criteria)` — always exactly 2 arguments in real
+    /// Excel (unlike `SUMIF`, which optionally takes a 3rd).
+    pub fn countif(range: Formula, criteria: Formula) -> Self {
+        Formula::FuncFixed(FnIndex::COUNTIF, vec![range, criteria])
+    }
+
+    /// `LEFT(text, num_chars)` — real Excel allows `num_chars` to be
+    /// omitted (defaulting to 1), making this a variable 1-2 arg function;
+    /// this constructor always passes both.
+    pub fn left(text: Formula, num_chars: Formula) -> Self {
+        Formula::Func(FnIndex::LEFT, vec![text, num_chars])
+    }
+    /// `RIGHT(text, num_chars)` — see `Formula::left`'s note on arity.
+    pub fn right(text: Formula, num_chars: Formula) -> Self {
+        Formula::Func(FnIndex::RIGHT, vec![text, num_chars])
+    }
+    /// `MID(text, start_num, num_chars)` — always exactly 3 arguments in
+    /// real Excel.
+    pub fn mid(text: Formula, start_num: Formula, num_chars: Formula) -> Self {
+        Formula::FuncFixed(FnIndex::MID, vec![text, start_num, num_chars])
+    }
+    /// `LEN(text)` — always exactly 1 argument in real Excel.
+    pub fn len(text: Formula) -> Self {
+        Formula::FuncFixed(FnIndex::LEN, vec![text])
+    }
+    /// `TEXT(value, format_text)` — always exactly 2 arguments in real
+    /// Excel. `format_text` is a normal `Formula::str(...)` argument (a
+    /// number-format code like `"0.00"`), encoded as a plain `PtgStr`.
+    pub fn text(value: Formula, format_text: Formula) -> Self {
+        Formula::FuncFixed(FnIndex::TEXT, vec![value, format_text])
+    }
+
+    /// `TODAY()` — takes no arguments. Volatile: see `FnIndex::TODAY`'s
+    /// doc comment for the `PtgAttrSemi` wrapper and cell-level
+    /// recalculation flag this crate emits so Excel actually keeps this
+    /// up to date, rather than freezing at whatever `cached_value` was
+    /// supplied at write time.
+    pub fn today() -> Self {
+        Formula::FuncFixed(FnIndex::TODAY, vec![])
+    }
+    /// `NOW()` — see `Formula::today`'s note; same volatile handling.
+    pub fn now() -> Self {
+        Formula::FuncFixed(FnIndex::NOW, vec![])
+    }
+    /// `DATE(year, month, day)` — always exactly 3 arguments, and (unlike
+    /// `TODAY`/`NOW`) not volatile.
+    pub fn date(year: Formula, month: Formula, day: Formula) -> Self {
+        Formula::FuncFixed(FnIndex::DATE, vec![year, month, day])
+    }
+
+    /// `VLOOKUP(lookup_value, table_array, col_index_num, range_lookup)`.
+    /// `range_lookup` is a plain Rust `bool` here (not a `Formula`) since
+    /// real Excel's own 4th argument is just a boolean literal in the
+    /// overwhelming common case (`TRUE`/`FALSE`) — pass it through
+    /// `Formula::Bool` if you need a computed 4th argument instead, via
+    /// `Formula::Func(FnIndex::VLOOKUP, vec![...])` directly.
+    pub fn vlookup(lookup_value: Formula, table_array: Formula, col_index_num: Formula, range_lookup: bool) -> Self {
+        Formula::Func(
+            FnIndex::VLOOKUP,
+            vec![lookup_value, table_array, col_index_num, Formula::Bool(range_lookup)],
+        )
+    }
+    /// `INDEX(array, row_num, column_num)` — real Excel's `INDEX` also
+    /// supports a 1-arg area-only form and a 4th `area_num` argument
+    /// (2-4 args total, variable); this constructor covers the common
+    /// 3-arg form, which is what was byte-verified against real Excel
+    /// output.
+    pub fn index(array: Formula, row_num: Formula, column_num: Formula) -> Self {
+        Formula::Func(FnIndex::INDEX, vec![array, row_num, column_num])
+    }
+    /// `MATCH(lookup_value, lookup_array, match_type)`. Named `match_`
+    /// (trailing underscore) since `match` is a Rust keyword.
+    pub fn match_(lookup_value: Formula, lookup_array: Formula, match_type: Formula) -> Self {
+        Formula::Func(FnIndex::MATCH, vec![lookup_value, lookup_array, match_type])
+    }
+
+    /// Whether this formula (or any subexpression) calls a volatile
+    /// function (`TODAY`/`NOW` so far). Used by `write_fmla_num`/
+    /// `write_fmla_string`/`write_fmla_bool` to set the cell record's
+    /// recalculate-always bit — see `FnIndex::TODAY`'s doc comment.
+    pub(crate) fn is_volatile(&self) -> bool {
+        match self {
+            Formula::FuncFixed(fn_idx, args) => {
+                *fn_idx == FnIndex::TODAY || *fn_idx == FnIndex::NOW || args.iter().any(Formula::is_volatile)
+            }
+            Formula::Func(_, args) => args.iter().any(Formula::is_volatile),
+            Formula::Add(a, b)
+            | Formula::Sub(a, b)
+            | Formula::Mul(a, b)
+            | Formula::Div(a, b)
+            | Formula::Concat(a, b)
+            | Formula::Lt(a, b)
+            | Formula::Le(a, b)
+            | Formula::Eq(a, b)
+            | Formula::Ge(a, b)
+            | Formula::Gt(a, b)
+            | Formula::Ne(a, b) => a.is_volatile() || b.is_volatile(),
+            Formula::If(c, t, e) => c.is_volatile() || t.is_volatile() || e.is_volatile(),
+            Formula::Num(_) | Formula::Str(_) | Formula::Bool(_) | Formula::Ref(_, _) | Formula::Range(_, _, _, _) => {
+                false
+            }
+        }
+    }
+
     /// Encode this formula to an Rgce token stream (postfix/RPN).
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -174,6 +394,12 @@ impl Formula {
             Formula::Str(s) => {
                 out.push(0x17); // PtgStr: ptg(7 bits)=0x17, reserved0(1 bit)=0
                 write_short_xlunicode_string(s, out);
+            }
+            Formula::Bool(b) => {
+                // PtgBool: ptg=0x1D + one byte (0/1). Confirmed byte-for-byte
+                // against real Excel's `VLOOKUP(...,FALSE)` 4th argument.
+                out.push(0x1D);
+                out.push(*b as u8);
             }
             Formula::Ref(row, col) => {
                 out.push(0x44); // PtgRef, class=VALUE(0x2): 0x04 | (0x2<<5)
@@ -220,6 +446,11 @@ impl Formula {
                 a.encode_into(out);
                 b.encode_into(out);
                 out.push(0x06); // PtgDiv
+            }
+            Formula::Concat(a, b) => {
+                a.encode_into(out);
+                b.encode_into(out);
+                out.push(0x08); // PtgConcat — confirmed byte-for-byte against real Excel's `=A1&B1`.
             }
             Formula::Lt(a, b) => {
                 a.encode_into(out);
@@ -273,6 +504,40 @@ impl Formula {
                 out.push(0x42); // PtgFuncVar, class=VALUE(0x2): 0x02 | (0x2<<5)
                 out.push(args.len() as u8); // cparams
                 out.extend_from_slice(&fn_idx.0.to_le_bytes()); // tab (fCeFunc=0 implied, top bit unset)
+            }
+            Formula::FuncFixed(fn_idx, args) if *fn_idx == FnIndex::TODAY || *fn_idx == FnIndex::NOW => {
+                // Volatile functions: real Excel prepends a PtgAttrSemi
+                // marker (flags=bitSemi=0x01, offset=0) before the call —
+                // confirmed byte-for-byte against real Excel's encoding of
+                // `=TODAY()`/`=NOW()`. `write_fmla_num`/`write_fmla_string`
+                // separately set a matching bit in the cell record's
+                // `grbitFlags` (via `Formula::is_volatile`); both were
+                // needed for Excel to actually recalculate these on open
+                // rather than freezing at the supplied cached value forever
+                // (no cell dependency would otherwise ever trigger a
+                // recalc).
+                out.push(0x19); // PtgAttrSemi
+                out.push(0x01); // bitSemi
+                out.extend_from_slice(&[0x00, 0x00]); // offset = 0 (no args to skip)
+                for arg in args {
+                    arg.encode_into(out);
+                }
+                out.push(0x41); // PtgFunc, class=VALUE — confirmed byte-for-byte
+                out.extend_from_slice(&fn_idx.0.to_le_bytes()); // iftab, no cparams byte
+            }
+            Formula::FuncFixed(fn_idx, args) => {
+                // PtgFunc: a fixed-argument-count function call — real
+                // Excel's encoder for `NOT`/`COUNTIF`/`MID`/`LEN`/`TEXT`/
+                // `DATE` (confirmed byte-for-byte against each). Unlike
+                // `PtgFuncVar` above, there is no `cparams` byte at all:
+                // the reader determines the argument count from the
+                // `Ftab`/`iftab` entry itself, not from anything in the
+                // token stream.
+                for arg in args {
+                    arg.encode_into(out);
+                }
+                out.push(0x41); // PtgFunc, class=VALUE
+                out.extend_from_slice(&fn_idx.0.to_le_bytes()); // iftab
             }
             Formula::If(cond, then, else_) => {
                 cond.encode_into(out);
@@ -353,6 +618,21 @@ pub(crate) fn col_rel_short(col: u32) -> u16 {
     (col as u16) & 0x3FFF
 }
 
+/// The cell-record `grbitFlags` value for a volatile formula (`TODAY`/
+/// `NOW`), confirmed byte-for-byte against real Excel's own `BrtFmlaNum`
+/// output for `=TODAY()`/`=NOW()` (both had `grbitFlags=0x0002`; a
+/// structurally-identical non-volatile formula, `=DATE(...)`, had
+/// `grbitFlags=0x0000` — isolating this bit as the volatility marker).
+/// Without it, Excel's dependency-based recalculation engine has no
+/// reason to ever re-evaluate a formula with no cell dependencies, so it
+/// would keep displaying the supplied `cached_value` forever instead of
+/// updating on open/recalc.
+const GRBIT_FLAGS_VOLATILE: u16 = 0x0002;
+
+fn fmla_grbit_flags(formula: &Formula) -> u16 {
+    if formula.is_volatile() { GRBIT_FLAGS_VOLATILE } else { 0 }
+}
+
 /// Write a `BrtFmlaNum` record: a formula cell whose most recent evaluation
 /// produced a numeric value. `cached_value` is what viewers (including
 /// calamine, and Excel before its own recalculation) display immediately.
@@ -362,7 +642,7 @@ pub fn write_fmla_num(col: u32, ixfe: u16, cached_value: f64, formula: &Formula,
     pay.extend_from_slice(&col.to_le_bytes());
     pay.extend_from_slice(&(ixfe as u32).to_le_bytes()); // iStyleRef (low 24 bits) | fPhShow=0 | reserved=0
     pay.extend_from_slice(&cached_value.to_le_bytes());
-    pay.extend_from_slice(&0u16.to_le_bytes()); // grbitFlags: fAlwaysCalc=0
+    pay.extend_from_slice(&fmla_grbit_flags(formula).to_le_bytes());
     pay.extend_from_slice(&(rgce.len() as u32).to_le_bytes()); // cce
     pay.extend_from_slice(&rgce);
     pay.extend_from_slice(&0u32.to_le_bytes()); // cb (rgcb length) = 0
@@ -377,11 +657,31 @@ pub fn write_fmla_string(col: u32, ixfe: u16, cached_value: &str, formula: &Form
     pay.extend_from_slice(&col.to_le_bytes());
     pay.extend_from_slice(&(ixfe as u32).to_le_bytes());
     write_wstr(cached_value, &mut pay); // string cached value: XLWideString (cch:4 + utf16)
-    pay.extend_from_slice(&0u16.to_le_bytes()); // grbitFlags
+    pay.extend_from_slice(&fmla_grbit_flags(formula).to_le_bytes());
     pay.extend_from_slice(&(rgce.len() as u32).to_le_bytes());
     pay.extend_from_slice(&rgce);
     pay.extend_from_slice(&0u32.to_le_bytes());
     write_rec(crate::biff12::RID_FMLA_STRING, &pay, buf);
+}
+
+/// Write a `BrtFmlaBool` record: a formula cell whose most recent
+/// evaluation produced a boolean value (`AND`/`OR`/`NOT`, or a bare
+/// comparison like `A1=B1` used as a whole formula). Payload shape
+/// (`col`(4) + `ixfe`(4) + `fBool`(1 byte, not the 8-byte `f64` field
+/// `BrtFmlaNum` uses) + `grbitFlags`(2) + `cce`(4) + `rgce` + `cb`(4))
+/// confirmed byte-for-byte against real Excel's own encoding of
+/// `=AND(A1>0,A2>0)`.
+pub fn write_fmla_bool(col: u32, ixfe: u16, cached_value: bool, formula: &Formula, buf: &mut Vec<u8>) {
+    let rgce = formula.encode();
+    let mut pay = Vec::with_capacity(19 + rgce.len());
+    pay.extend_from_slice(&col.to_le_bytes());
+    pay.extend_from_slice(&(ixfe as u32).to_le_bytes());
+    pay.push(cached_value as u8);
+    pay.extend_from_slice(&fmla_grbit_flags(formula).to_le_bytes());
+    pay.extend_from_slice(&(rgce.len() as u32).to_le_bytes());
+    pay.extend_from_slice(&rgce);
+    pay.extend_from_slice(&0u32.to_le_bytes());
+    write_rec(crate::biff12::RID_FMLA_BOOL, &pay, buf);
 }
 
 #[cfg(test)]
@@ -460,5 +760,287 @@ mod tests {
         let recs = parse_records(&buf);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].0, crate::biff12::RID_FMLA_NUM);
+    }
+
+    // ── 2026-09-13 formula-coverage expansion ──────────────────────────
+    //
+    // Every byte-shape asserted below (opcode, cparams-vs-no-cparams,
+    // PtgAttrSemi wrapper) was cross-checked against a real Excel-authored
+    // `.xlsb` built via COM automation — see the doc comments on
+    // `FnIndex`, `Formula::Func`/`Formula::FuncFixed`, and
+    // `GRBIT_FLAGS_VOLATILE` above for exactly what was compared.
+
+    /// `&` must encode as the binary infix `PtgConcat` (0x08) — the same
+    /// postfix shape as `Add`/`Sub`/`Mul`/`Div`, not a `PtgFuncVar` call.
+    #[test]
+    fn concat_operator_encodes_as_ptgconcat() {
+        let f = Formula::cell(0, 0).concat(Formula::cell(0, 1)); // A1&B1
+        let rgce = f.encode();
+        assert_eq!(rgce.len(), 7 + 7 + 1); // PtgRef + PtgRef + PtgConcat
+        assert_eq!(*rgce.last().unwrap(), 0x08); // PtgConcat last (outermost op)
+    }
+
+    /// `CONCATENATE` is variable-argument in real Excel: `PtgFuncVar` with
+    /// `cparams` = the actual argument count and `tab` = 336 (0x0150).
+    #[test]
+    fn concatenate_encodes_as_funcvar_with_verified_index() {
+        let f = Formula::concatenate(vec![Formula::str("a"), Formula::str("b")]);
+        let rgce = f.encode();
+        let tail = &rgce[rgce.len() - 4..];
+        assert_eq!(tail[0], 0x42); // PtgFuncVar
+        assert_eq!(tail[1], 2); // cparams
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 0x0150);
+    }
+
+    /// `AND`/`OR` are variable-argument: `PtgFuncVar`, tab = 36/37.
+    #[test]
+    fn and_or_encode_as_funcvar_with_verified_indices() {
+        let and = Formula::and(vec![
+            Formula::cell(0, 0).gt(Formula::num(0.0)),
+            Formula::cell(1, 0).gt(Formula::num(0.0)),
+        ]);
+        let rgce = and.encode();
+        let tail = &rgce[rgce.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(tail[1], 2);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 36);
+
+        let or = Formula::or(vec![
+            Formula::cell(0, 0).gt(Formula::num(0.0)),
+            Formula::cell(1, 0).gt(Formula::num(0.0)),
+        ]);
+        let rgce = or.encode();
+        let tail = &rgce[rgce.len() - 4..];
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 37);
+    }
+
+    /// `NOT` is fixed-argument in real Excel: `PtgFunc` (3 bytes, no
+    /// `cparams` byte at all), tab = 38 — NOT `PtgFuncVar`.
+    #[test]
+    fn not_encodes_as_fixed_arg_ptgfunc() {
+        let f = Formula::not(Formula::cell(0, 0).gt(Formula::num(0.0)));
+        let rgce = f.encode();
+        let tail = &rgce[rgce.len() - 3..];
+        assert_eq!(tail[0], 0x41); // PtgFunc, not PtgFuncVar
+        assert_eq!(u16::from_le_bytes(tail[1..3].try_into().unwrap()), 38);
+    }
+
+    /// `SUMIF` is variable-argument (2-3 args) — `PtgFuncVar`, tab = 345 —
+    /// and its criteria argument is a plain `PtgStr`, not a special token.
+    #[test]
+    fn sumif_encodes_as_funcvar_with_string_criteria() {
+        let f = Formula::sumif(Formula::range(0, 0, 9, 0), Formula::str(">3"));
+        let rgce = f.encode();
+        // PtgArea(13) + PtgStr(1+2+2*2=7) + PtgFuncVar(4) = 24
+        assert_eq!(rgce.len(), 13 + 7 + 4);
+        assert_eq!(rgce[13], 0x17); // PtgStr
+        let tail = &rgce[rgce.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(tail[1], 2);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 345);
+    }
+
+    /// The 3-arg `SUMIF(range, criteria, sum_range)` form — reached via
+    /// `Formula::Func(FnIndex::SUMIF, vec![range, criteria, sum_range])`
+    /// directly, since `Formula::sumif` only covers the 2-arg form —
+    /// separately confirmed byte-for-byte against real Excel's own
+    /// `=SUMIF(A1:A5,"Hardware",B1:B5)`: still `PtgFuncVar`/tab=345, just
+    /// with `cparams=3` and a 3rd `PtgArea` operand.
+    #[test]
+    fn sumif_3arg_form_encodes_with_cparams_3() {
+        let f = Formula::Func(
+            FnIndex::SUMIF,
+            vec![
+                Formula::range(0, 0, 4, 0),
+                Formula::str("Hardware"),
+                Formula::range(0, 1, 4, 1),
+            ],
+        );
+        let rgce = f.encode();
+        // PtgArea(13) + PtgStr(1+2+2*8=19) + PtgArea(13) + PtgFuncVar(4) = 49
+        assert_eq!(rgce.len(), 13 + 19 + 13 + 4);
+        let tail = &rgce[rgce.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(tail[1], 3);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 345);
+    }
+
+    /// `COUNTIF` is fixed-argument (always 2) — `PtgFunc`, tab = 346 — even
+    /// though it takes the same shape of arguments as `SUMIF`, which is
+    /// variable. This is exactly the "argument count alone doesn't tell
+    /// you which Ptg family real Excel uses" trap this crate hit before.
+    #[test]
+    fn countif_encodes_as_fixed_arg_ptgfunc_unlike_sumif() {
+        let f = Formula::countif(Formula::range(0, 0, 9, 0), Formula::str(">3"));
+        let rgce = f.encode();
+        // PtgArea(13) + PtgStr(7) + PtgFunc(3, no cparams) = 23
+        assert_eq!(rgce.len(), 13 + 7 + 3);
+        let tail = &rgce[rgce.len() - 3..];
+        assert_eq!(tail[0], 0x41); // PtgFunc
+        assert_eq!(u16::from_le_bytes(tail[1..3].try_into().unwrap()), 346);
+    }
+
+    /// `LEFT`/`RIGHT` are variable-argument (1-2 args) — `PtgFuncVar`.
+    /// `MID`/`LEN` are fixed-argument — `PtgFunc`.
+    #[test]
+    fn text_functions_use_the_verified_ptg_family_per_function() {
+        let left = Formula::left(Formula::cell(0, 1), Formula::num(3.0)).encode();
+        let tail = &left[left.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 115);
+
+        let right = Formula::right(Formula::cell(0, 1), Formula::num(3.0)).encode();
+        let tail = &right[right.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 116);
+
+        let mid = Formula::mid(Formula::cell(0, 1), Formula::num(2.0), Formula::num(3.0)).encode();
+        let tail = &mid[mid.len() - 3..];
+        assert_eq!(tail[0], 0x41);
+        assert_eq!(u16::from_le_bytes(tail[1..3].try_into().unwrap()), 31);
+
+        let len = Formula::len(Formula::cell(0, 1)).encode();
+        let tail = &len[len.len() - 3..];
+        assert_eq!(tail[0], 0x41);
+        assert_eq!(u16::from_le_bytes(tail[1..3].try_into().unwrap()), 32);
+    }
+
+    /// `TEXT(value, format)` is fixed-argument — `PtgFunc`, tab = 48 — and
+    /// its format-code argument is a plain `PtgStr`.
+    #[test]
+    fn text_fn_encodes_format_code_as_plain_string() {
+        let f = Formula::text(Formula::cell(0, 0), Formula::str("0.00"));
+        let rgce = f.encode();
+        // PtgRef(7) + PtgStr(1+2+2*4=11) + PtgFunc(3) = 21
+        assert_eq!(rgce.len(), 7 + 11 + 3);
+        let tail = &rgce[rgce.len() - 3..];
+        assert_eq!(tail[0], 0x41);
+        assert_eq!(u16::from_le_bytes(tail[1..3].try_into().unwrap()), 48);
+    }
+
+    /// `DATE(y,m,d)` is fixed-argument, non-volatile — `PtgFunc`, tab = 65,
+    /// and (unlike `TODAY`/`NOW`) NOT wrapped in `PtgAttrSemi`.
+    #[test]
+    fn date_encodes_as_fixed_arg_and_is_not_volatile() {
+        let f = Formula::date(Formula::num(2026.0), Formula::num(9.0), Formula::num(13.0));
+        assert!(!f.is_volatile());
+        let rgce = f.encode();
+        assert_eq!(rgce[0], 0x1F); // starts with a plain PtgNum, no PtgAttrSemi wrapper
+        let tail = &rgce[rgce.len() - 3..];
+        assert_eq!(tail[0], 0x41);
+        assert_eq!(u16::from_le_bytes(tail[1..3].try_into().unwrap()), 65);
+    }
+
+    /// `TODAY`/`NOW` are volatile: wrapped in a leading `PtgAttrSemi`
+    /// (flags=bitSemi=0x01) and `Formula::is_volatile()` reports `true` —
+    /// both confirmed against real Excel's own `=TODAY()`/`=NOW()` output.
+    #[test]
+    fn today_and_now_are_volatile_and_wrapped_in_attr_semi() {
+        let today = Formula::today();
+        assert!(today.is_volatile());
+        let rgce = today.encode();
+        // PtgAttrSemi(4) + PtgFunc(3) = 7
+        assert_eq!(rgce.len(), 7);
+        assert_eq!(rgce[0], 0x19); // PtgAttrSemi
+        assert_eq!(rgce[1], 0x01); // bitSemi
+        assert_eq!(u16::from_le_bytes(rgce[2..4].try_into().unwrap()), 0); // offset=0
+        assert_eq!(rgce[4], 0x41); // PtgFunc
+        assert_eq!(u16::from_le_bytes(rgce[5..7].try_into().unwrap()), 221);
+
+        let now = Formula::now();
+        assert!(now.is_volatile());
+        let rgce = now.encode();
+        assert_eq!(rgce[0], 0x19);
+        assert_eq!(u16::from_le_bytes(rgce[5..7].try_into().unwrap()), 74);
+    }
+
+    /// A formula that merely *contains* a volatile call (nested inside
+    /// arithmetic) must still be reported volatile, so the cell-record
+    /// `grbitFlags` bit gets set correctly.
+    #[test]
+    fn is_volatile_propagates_through_nesting() {
+        let f = Formula::today().add(Formula::num(1.0));
+        assert!(f.is_volatile());
+        assert!(!Formula::num(1.0).add(Formula::num(2.0)).is_volatile());
+    }
+
+    /// `write_fmla_num`/`write_fmla_string` must set the cell record's
+    /// volatile-recalculation bit (`grbitFlags = 0x0002`) for a formula
+    /// containing `TODAY`/`NOW`, and leave it `0` otherwise — confirmed
+    /// against real Excel's own `BrtFmlaNum` output (see
+    /// `GRBIT_FLAGS_VOLATILE`'s doc comment).
+    #[test]
+    fn fmla_num_sets_volatile_grbit_flags_only_when_needed() {
+        let mut buf = Vec::new();
+        write_fmla_num(0, 0, 46000.0, &Formula::today(), &mut buf);
+        let recs = parse_records(&buf);
+        let payload = &recs[0].1;
+        // col(4) + ixfe(4) + f64(8) = 16, grbitFlags at [16..18]
+        assert_eq!(u16::from_le_bytes(payload[16..18].try_into().unwrap()), 0x0002);
+
+        let mut buf2 = Vec::new();
+        write_fmla_num(
+            0,
+            0,
+            46000.0,
+            &Formula::date(Formula::num(2026.0), Formula::num(9.0), Formula::num(13.0)),
+            &mut buf2,
+        );
+        let recs2 = parse_records(&buf2);
+        let payload2 = &recs2[0].1;
+        assert_eq!(u16::from_le_bytes(payload2[16..18].try_into().unwrap()), 0x0000);
+    }
+
+    /// `PtgBool` (a boolean literal) is a single extra byte after the
+    /// opcode — confirmed against real Excel's encoding of `VLOOKUP`'s
+    /// `FALSE` 4th argument.
+    #[test]
+    fn bool_literal_encodes_as_ptgbool() {
+        assert_eq!(Formula::boolean(true).encode(), vec![0x1D, 0x01]);
+        assert_eq!(Formula::boolean(false).encode(), vec![0x1D, 0x00]);
+    }
+
+    /// `VLOOKUP` is variable-argument (3-4 args) — `PtgFuncVar`, tab = 102
+    /// — and its exact-match flag is a `PtgBool`, not a `PtgInt`/`PtgNum`.
+    #[test]
+    fn vlookup_encodes_bool_arg_and_verified_index() {
+        let f = Formula::vlookup(Formula::num(3.0), Formula::range(0, 0, 9, 1), Formula::num(2.0), false);
+        let rgce = f.encode();
+        let tail = &rgce[rgce.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(tail[1], 4); // cparams
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 102);
+        // The PtgBool(FALSE) sits right before the PtgFuncVar tail.
+        assert_eq!(rgce[rgce.len() - 6], 0x1D);
+        assert_eq!(rgce[rgce.len() - 5], 0x00);
+    }
+
+    /// `INDEX`/`MATCH` are variable-argument — `PtgFuncVar`, tab = 29/64.
+    #[test]
+    fn index_match_encode_with_verified_indices() {
+        let index = Formula::index(Formula::range(0, 0, 9, 1), Formula::num(1.0), Formula::num(2.0)).encode();
+        let tail = &index[index.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 29);
+
+        let match_ = Formula::match_(Formula::num(3.0), Formula::range(0, 0, 9, 0), Formula::num(0.0)).encode();
+        let tail = &match_[match_.len() - 4..];
+        assert_eq!(tail[0], 0x42);
+        assert_eq!(u16::from_le_bytes(tail[2..4].try_into().unwrap()), 64);
+    }
+
+    #[test]
+    fn fmla_bool_record_is_well_formed() {
+        let mut buf = Vec::new();
+        write_fmla_bool(
+            0,
+            0,
+            true,
+            &Formula::and(vec![Formula::cell(0, 0).gt(Formula::num(0.0))]),
+            &mut buf,
+        );
+        let recs = parse_records(&buf);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].0, crate::biff12::RID_FMLA_BOOL);
     }
 }

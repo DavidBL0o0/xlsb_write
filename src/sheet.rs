@@ -364,6 +364,9 @@ pub fn encode_row(
             CellValue::FormulaStr(formula, cached) => {
                 crate::formula::write_fmla_string(col, ixfe, cached, formula, &mut cell_buf);
             }
+            CellValue::FormulaBool(formula, cached) => {
+                crate::formula::write_fmla_bool(col, ixfe, *cached, formula, &mut cell_buf);
+            }
         }
     }
 

@@ -259,6 +259,167 @@ fn roundtrip_formulas_through_calamine() {
     println!("Formula round-trip OK. File written to: {}", path.display());
 }
 
+/// The 2026-09-13 formula-coverage expansion (string concat, logical,
+/// conditional-aggregate, text, and lookup functions) — round-tripped
+/// through calamine the same way the original formula set was, to prove
+/// the new `PtgConcat`/`PtgFunc`/`PtgBool` encodings produce a file an
+/// independent reader parses correctly, not just one this crate's own
+/// encoder/disassembler agree on.
+#[test]
+fn roundtrip_new_formula_functions_through_calamine() {
+    let mut wb = Workbook::new();
+    let sheet = wb.add_worksheet("Funcs");
+
+    // Row 0: base data used by several formulas below. All of row 0's
+    // cells (base data + every formula) must be written before moving on
+    // to row 1 — rows are finalized in non-decreasing order (see
+    // `Worksheet`'s row-ordering contract in GUIDE.md).
+    sheet.write_number(0, 0, 5.0); // A1
+    sheet.write_string(0, 1, "hello"); // B1
+
+    // `&` concat operator and `CONCATENATE`.
+    let concat_op = Formula::cell(0, 0).concat(Formula::cell(0, 1));
+    sheet.write_formula_str(0, 2, concat_op, "5hello");
+    let concatenate_fn = Formula::concatenate(vec![Formula::cell(0, 0), Formula::cell(0, 1)]);
+    sheet.write_formula_str(0, 3, concatenate_fn, "5hello");
+
+    // AND / OR / NOT — boolean formula cells (`BrtFmlaBool`).
+    let and_f = Formula::and(vec![Formula::cell(0, 0).gt(Formula::num(0.0)), Formula::boolean(true)]);
+    sheet.write_formula_bool(0, 4, and_f, true);
+    let or_f = Formula::or(vec![Formula::cell(0, 0).lt(Formula::num(0.0)), Formula::boolean(true)]);
+    sheet.write_formula_bool(0, 5, or_f, true);
+    let not_f = Formula::not(Formula::cell(0, 0).gt(Formula::num(0.0)));
+    sheet.write_formula_bool(0, 6, not_f, false);
+
+    // SUMIF / COUNTIF over A1:A10 (values 5,2,3,...,10 — see above).
+    let sumif_f = Formula::sumif(Formula::range(0, 0, 9, 0), Formula::str(">3"));
+    let sumif_expected: f64 = [5.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        .into_iter()
+        .filter(|&v| v > 3.0)
+        .sum();
+    sheet.write_formula_num(0, 7, sumif_f, sumif_expected);
+    let countif_f = Formula::countif(Formula::range(0, 0, 9, 0), Formula::str(">3"));
+    let countif_expected: f64 = [5.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        .into_iter()
+        .filter(|&v| v > 3.0)
+        .count() as f64;
+    sheet.write_formula_num(0, 8, countif_f, countif_expected);
+
+    // Text functions on B1="hello".
+    sheet.write_formula_str(0, 9, Formula::left(Formula::cell(0, 1), Formula::num(3.0)), "hel");
+    sheet.write_formula_str(0, 10, Formula::right(Formula::cell(0, 1), Formula::num(3.0)), "llo");
+    sheet.write_formula_str(
+        0,
+        11,
+        Formula::mid(Formula::cell(0, 1), Formula::num(2.0), Formula::num(3.0)),
+        "ell",
+    );
+    sheet.write_formula_num(0, 12, Formula::len(Formula::cell(0, 1)), 5.0);
+
+    // DATE(2026,9,13) — a fixed, non-volatile function; check the cached
+    // serial round-trips (calamine reads formula cells' cached value, it
+    // does not evaluate formulas itself).
+    let date_f = Formula::date(Formula::num(2026.0), Formula::num(9.0), Formula::num(13.0));
+    sheet.write_formula_num(0, 13, date_f, 46278.0);
+
+    // VLOOKUP / INDEX / MATCH over A1:B10 (B2..B10 left blank; only B1 is set).
+    let vlookup_f = Formula::vlookup(Formula::num(5.0), Formula::range(0, 0, 9, 1), Formula::num(2.0), false);
+    sheet.write_formula_str(0, 14, vlookup_f, "hello");
+    let index_f = Formula::index(Formula::range(0, 0, 9, 1), Formula::num(1.0), Formula::num(2.0));
+    sheet.write_formula_str(0, 15, index_f, "hello");
+    let match_f = Formula::match_(Formula::num(5.0), Formula::range(0, 0, 9, 0), Formula::num(0.0));
+    sheet.write_formula_num(0, 16, match_f, 1.0);
+
+    // Now that row 0 is fully written, fill in A2..A10 = 2..10 (the rest of
+    // the SUMIF/COUNTIF/VLOOKUP/MATCH range) — these don't need any other
+    // column populated.
+    for r in 1..10u32 {
+        sheet.write_number(r, 0, (r + 1) as f64);
+    }
+
+    let mut buf = Cursor::new(Vec::new());
+    wb.write(&mut buf).unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_new_functions.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let range = wbk.worksheet_range("Funcs").expect("sheet not found");
+
+    assert_eq!(
+        range.get_value((0, 2)).and_then(Data::as_string),
+        Some("5hello".to_string())
+    );
+    assert_eq!(
+        range.get_value((0, 3)).and_then(Data::as_string),
+        Some("5hello".to_string())
+    );
+    assert_eq!(range.get_value((0, 4)), Some(&Data::Bool(true)));
+    assert_eq!(range.get_value((0, 5)), Some(&Data::Bool(true)));
+    assert_eq!(range.get_value((0, 6)), Some(&Data::Bool(false)));
+    assert_eq!(range.get_value((0, 7)).and_then(Data::as_f64), Some(sumif_expected));
+    assert_eq!(range.get_value((0, 8)).and_then(Data::as_f64), Some(countif_expected));
+    assert_eq!(
+        range.get_value((0, 9)).and_then(Data::as_string),
+        Some("hel".to_string())
+    );
+    assert_eq!(
+        range.get_value((0, 10)).and_then(Data::as_string),
+        Some("llo".to_string())
+    );
+    assert_eq!(
+        range.get_value((0, 11)).and_then(Data::as_string),
+        Some("ell".to_string())
+    );
+    assert_eq!(range.get_value((0, 12)).and_then(Data::as_f64), Some(5.0));
+    assert_eq!(range.get_value((0, 13)).and_then(Data::as_f64), Some(46278.0));
+    assert_eq!(
+        range.get_value((0, 14)).and_then(Data::as_string),
+        Some("hello".to_string())
+    );
+    assert_eq!(
+        range.get_value((0, 15)).and_then(Data::as_string),
+        Some("hello".to_string())
+    );
+    assert_eq!(range.get_value((0, 16)).and_then(Data::as_f64), Some(1.0));
+
+    println!(
+        "New formula functions round-trip OK. File written to: {}",
+        path.display()
+    );
+}
+
+/// `TODAY()`/`NOW()` are volatile: this crate wraps their call in a
+/// `PtgAttrSemi` marker and sets the cell record's recalculate-always
+/// `grbitFlags` bit (see `formula::GRBIT_FLAGS_VOLATILE`'s doc comment).
+/// Neither affects the cached value calamine reads back — this test just
+/// confirms the extra tokens don't corrupt the record for an independent
+/// reader.
+#[test]
+fn roundtrip_volatile_functions_through_calamine() {
+    let mut wb = Workbook::new();
+    let sheet = wb.add_worksheet("Volatile");
+    sheet.write_formula_num(0, 0, Formula::today(), 46278.0);
+    sheet.write_formula_num(0, 1, Formula::now(), 46278.5);
+
+    let mut buf = Cursor::new(Vec::new());
+    wb.write(&mut buf).unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_volatile.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let range = wbk.worksheet_range("Volatile").expect("sheet not found");
+    assert_eq!(range.get_value((0, 0)).and_then(Data::as_f64), Some(46278.0));
+    assert_eq!(range.get_value((0, 1)).and_then(Data::as_f64), Some(46278.5));
+
+    println!("Volatile functions round-trip OK. File written to: {}", path.display());
+}
+
 /// `IF`/`IFERROR` use branch tokens (`PtgAttrIf`/`PtgAttrGoto`) with
 /// precise byte-offset jumps — the riskiest formula encoding in this
 /// crate. Verify with cases matching the legacy pipeline's actual
