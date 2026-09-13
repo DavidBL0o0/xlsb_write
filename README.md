@@ -55,6 +55,10 @@ formulas, using `StreamingWorkbook`:
 cargo run --example sales_report
 ```
 
+**For the full picture — every method, number-format shorthands, the
+complete formula builder, `Workbook` vs `StreamingWorkbook`, performance
+notes, and what's not supported — see [GUIDE.md](GUIDE.md).**
+
 ## Status
 
 Byte-level output is verified against real Excel-produced reference files
