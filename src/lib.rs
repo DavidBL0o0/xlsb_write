@@ -324,15 +324,42 @@ impl Worksheet {
         self
     }
 
-    /// Set a row's height, in points (Excel's default is 15.0).
+    /// A row's height/hidden state is baked into its encoded bytes at
+    /// flush time (see `flush_pending_row`), which happens the moment a
+    /// *later* row starts — after that, `row_specs` is still writable but
+    /// has silently stopped affecting anything, since the row it would
+    /// apply to has already been streamed out. This is a stricter
+    /// deadline than "before the sheet finishes" (unlike, say,
+    /// `merge_range`, which is only read once at the very end) and, until
+    /// this check existed, failed silently rather than panicking like
+    /// every other out-of-order-write contract in this crate.
+    fn check_row_not_flushed(&self, row: u32, what: &str) {
+        if let Some(flushed) = self.last_flushed_row {
+            assert!(
+                row > flushed,
+                "xlsb_write: {what}(row={row}, ..) called after row {flushed} was already \
+                 flushed to the output (this Worksheet streams each row to its encoded form \
+                 the moment a later row starts) — the change has no effect on bytes already \
+                 written. Call {what} before writing any cell in a later row."
+            );
+        }
+    }
+
+    /// Set a row's height, in points (Excel's default is 15.0). Must be
+    /// called before any cell in a *later* row is written — see
+    /// `check_row_not_flushed`.
     pub fn set_row_height(&mut self, row: u32, height_pt: f32) -> &mut Self {
+        self.check_row_not_flushed(row, "set_row_height");
         let hidden = self.row_specs.get(&row).map(|&(_, h)| h).unwrap_or(false);
         self.row_specs.insert(row, (height_pt, hidden));
         self
     }
 
     /// Hide a row. Keeps any height previously set with `set_row_height`.
+    /// Must be called before any cell in a *later* row is written — see
+    /// `check_row_not_flushed`.
     pub fn set_row_hidden(&mut self, row: u32) -> &mut Self {
+        self.check_row_not_flushed(row, "set_row_hidden");
         let height = self.row_specs.get(&row).map(|&(h, _)| h).unwrap_or(DEFAULT_ROW_HEIGHT_PT);
         self.row_specs.insert(row, (height, true));
         self
@@ -509,6 +536,306 @@ impl std::ops::DerefMut for StreamingWorksheet {
     }
 }
 
+/// A `Worksheet` created by `StreamingWorkbook::new_worksheet_sized`. Unlike
+/// `StreamingWorksheet` (which still buffers the whole sheet's encoded
+/// bytes in `body` until `finish_worksheet` copies them out), this type
+/// writes every finished row straight to the underlying zip entry and drops
+/// its bytes immediately — `body` never holds more than one row at a time.
+///
+/// The header (`BrtWsDim` etc.) is written lazily, the first time a row is
+/// actually flushed (i.e. the moment `body` first has bytes to send) —
+/// deliberately *not* at construction, so ordinary layout calls
+/// (`set_freeze_panes`, `set_column_width`, ...) still work exactly like
+/// they do on `Worksheet`/`StreamingWorksheet` as long as they happen
+/// before any row has been flushed. Once the header has gone out, those
+/// calls panic instead of silently being ignored (see each method's own
+/// doc comment) — a `BrtWsDim`/`BrtBeginColInfos`/freeze-pane state that
+/// doesn't match what was actually sent is exactly the class of bug this
+/// crate has already shipped and fixed once (see `sheet::write_sheet_header`).
+///
+/// Cell writes here return `Result`, unlike `Worksheet`'s infallible
+/// `&mut Self` builder methods — a cell write can trigger a real
+/// `zip.write_all` (whenever it finishes the previous row), so it can fail
+/// with a genuine I/O error in a way a purely in-memory `Worksheet` write
+/// never could.
+pub struct SizedStreamingWorksheet<'a, W: Write + Seek> {
+    inner: Worksheet,
+    zip: &'a mut ZipWriter<W>,
+    number: usize,
+    active: bool,
+    /// Declared inclusive bounds from `new_worksheet_sized` — `BrtWsDim` is
+    /// written as exactly `[0..=last_row] x [0..=last_col]`, regardless of
+    /// how much of that range ends up actually written (see this crate's
+    /// `2026-09-13-round6-streaming-and-parallel-write.md` for why a
+    /// superset bound is safe: verified empirically against real Excel via
+    /// COM automation — a declared extent larger than the real content
+    /// opens with no repair dialog, same as an exact-match extent).
+    last_row: u32,
+    last_col: u32,
+    /// Set the moment the header has actually been sent to `zip` — once
+    /// true, every layout method that would otherwise change what the
+    /// header says (freeze panes, column width/hidden) panics instead of
+    /// being silently ignored.
+    header_written: bool,
+}
+
+impl<'a, W: Write + Seek> std::ops::Deref for SizedStreamingWorksheet<'a, W> {
+    type Target = Worksheet;
+    fn deref(&self) -> &Worksheet {
+        &self.inner
+    }
+}
+impl<'a, W: Write + Seek> std::ops::DerefMut for SizedStreamingWorksheet<'a, W> {
+    fn deref_mut(&mut self) -> &mut Worksheet {
+        &mut self.inner
+    }
+}
+
+impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
+    /// # Panics
+    /// If `row > last_row` or `col > last_col` — the declared extent is a
+    /// checked contract, not a silently-trusted hint (see this crate's own
+    /// history of `BrtWsDim` mismatches corrupting output).
+    fn check_bounds(&self, row: u32, col: u32) {
+        assert!(
+            row <= self.last_row && col <= self.last_col,
+            "xlsb_write: cell ({row}, {col}) is outside the extent [0..={}] x [0..={}] declared in \
+             new_worksheet_sized(\"{}\", {}, {}) — this sized-streaming sheet already sent a header \
+             promising that bound, so a cell outside it can't be accommodated. Pass a larger \
+             last_row/last_col if the real data can exceed what you declared.",
+            self.last_row, self.last_col, self.inner.name, self.last_row, self.last_col,
+        );
+    }
+
+    /// # Panics
+    /// If called after this sheet's header has already been written to
+    /// `zip` (i.e. after the first row-flush) — see the struct doc comment.
+    fn assert_header_not_sent(&self, method: &str) {
+        assert!(
+            !self.header_written,
+            "xlsb_write: {method} was called on sheet \"{}\" after its header had already been \
+             written (triggered by the first row-flush) — sized-streaming sheets bake freeze-pane/\
+             column state into the header lazily on first flush, so layout must be finalized before \
+             that point (before starting a second row, or before calling `finish()` on a one-row \
+             sheet).",
+            self.inner.name,
+        );
+    }
+
+    /// Write this sheet's header (`BrtWsDim` using the *declared* extent,
+    /// not whatever's actually been written so far) and open the zip entry.
+    /// Called at most once, the first time a row is flushed (or, for a
+    /// sheet with zero or one rows, from `finish`).
+    fn write_header(&mut self) -> Result<(), WriteError> {
+        let col_specs: Vec<sheet::ColSpec> =
+            self.inner.col_specs.iter().map(|(&col, &(w, hidden))| (col, w, hidden)).collect();
+        let dim = Some((0, self.last_row, 0, self.last_col));
+
+        let mut header = Vec::with_capacity(512);
+        sheet::write_sheet_header(
+            self.inner.freeze_row,
+            self.inner.freeze_col,
+            &col_specs,
+            dim,
+            self.active,
+            &mut header,
+        );
+
+        self.zip.start_file(format!("xl/worksheets/sheet{}.bin", self.number), zip_options())?;
+        self.zip.write_all(&header)?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    /// If `stage_cell` just flushed a row into `self.inner.body`, send it to
+    /// `zip` (writing the header first if this is the very first flush) and
+    /// clear `body` — this is what keeps peak memory at "one row," instead
+    /// of "the whole sheet," the entire point of this type.
+    fn drain_flushed_row(&mut self) -> Result<(), WriteError> {
+        if self.inner.body.is_empty() {
+            return Ok(());
+        }
+        if !self.header_written {
+            self.write_header()?;
+        }
+        self.zip.write_all(&self.inner.body)?;
+        self.inner.body.clear();
+        Ok(())
+    }
+
+    pub fn write_string(&mut self, row: u32, col: u32, value: &str) -> Result<(), WriteError> {
+        self.write_string_with_format(row, col, value, &Format::default())
+    }
+    pub fn write_string_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        value: &str,
+        fmt: &Format,
+    ) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        let s = self.inner.intern_string(value);
+        self.inner.stage_cell(row, col, CellValue::String(s), xf);
+        self.drain_flushed_row()
+    }
+
+    pub fn write_number(&mut self, row: u32, col: u32, value: f64) -> Result<(), WriteError> {
+        self.write_number_with_format(row, col, value, &Format::default())
+    }
+    pub fn write_number_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        value: f64,
+        fmt: &Format,
+    ) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        self.inner.stage_cell(row, col, CellValue::Number(value), xf);
+        self.drain_flushed_row()
+    }
+
+    pub fn write_boolean(&mut self, row: u32, col: u32, value: bool) -> Result<(), WriteError> {
+        self.write_boolean_with_format(row, col, value, &Format::default())
+    }
+    pub fn write_boolean_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        value: bool,
+        fmt: &Format,
+    ) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        self.inner.stage_cell(row, col, CellValue::Bool(value), xf);
+        self.drain_flushed_row()
+    }
+
+    pub fn write_blank(&mut self, row: u32, col: u32) -> Result<(), WriteError> {
+        self.write_blank_with_format(row, col, &Format::default())
+    }
+    pub fn write_blank_with_format(&mut self, row: u32, col: u32, fmt: &Format) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        self.inner.stage_cell(row, col, CellValue::Blank, xf);
+        self.drain_flushed_row()
+    }
+
+    /// See `Worksheet::write_formula_num` — `cached_value` must match what
+    /// the formula actually computes; other readers (including `calamine`)
+    /// display exactly this cached value and never evaluate the formula.
+    pub fn write_formula_num(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: f64,
+    ) -> Result<(), WriteError> {
+        self.write_formula_num_with_format(row, col, formula, cached_value, &Format::default())
+    }
+    pub fn write_formula_num_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: f64,
+        fmt: &Format,
+    ) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        self.inner.stage_cell(row, col, CellValue::FormulaNum(Box::new(formula), cached_value), xf);
+        self.drain_flushed_row()
+    }
+
+    /// See `Worksheet::write_formula_str`.
+    pub fn write_formula_str(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: &str,
+    ) -> Result<(), WriteError> {
+        self.write_formula_str_with_format(row, col, formula, cached_value, &Format::default())
+    }
+    pub fn write_formula_str_with_format(
+        &mut self,
+        row: u32,
+        col: u32,
+        formula: Formula,
+        cached_value: &str,
+        fmt: &Format,
+    ) -> Result<(), WriteError> {
+        self.check_bounds(row, col);
+        let xf = self.inner.resolve_format(fmt);
+        self.inner.stage_cell(row, col, CellValue::FormulaStr(Box::new(formula), cached_value.to_owned()), xf);
+        self.drain_flushed_row()
+    }
+
+    /// Same contract as `Worksheet::set_freeze_panes`.
+    ///
+    /// # Panics
+    /// If called after this sheet's header has already been sent (see the
+    /// struct doc comment) — freeze-pane state is baked into the header,
+    /// so it can't be changed once the header is gone.
+    pub fn set_freeze_panes(&mut self, rows: u32) -> &mut Self {
+        self.assert_header_not_sent("set_freeze_panes");
+        self.inner.set_freeze_panes(rows);
+        self
+    }
+
+    /// Same contract as `Worksheet::set_freeze_panes_cols`.
+    ///
+    /// # Panics
+    /// Same as `set_freeze_panes`.
+    pub fn set_freeze_panes_cols(&mut self, cols: u32) -> &mut Self {
+        self.assert_header_not_sent("set_freeze_panes_cols");
+        self.inner.set_freeze_panes_cols(cols);
+        self
+    }
+
+    /// Same contract as `Worksheet::set_column_width`.
+    ///
+    /// # Panics
+    /// If called after this sheet's header has already been sent — column
+    /// widths are baked into the header's `BrtBeginColInfos` block.
+    pub fn set_column_width(&mut self, col: u32, width_chars: f64) -> &mut Self {
+        self.assert_header_not_sent("set_column_width");
+        self.inner.set_column_width(col, width_chars);
+        self
+    }
+
+    /// Same contract as `Worksheet::set_column_hidden`.
+    ///
+    /// # Panics
+    /// Same as `set_column_width`.
+    pub fn set_column_hidden(&mut self, col: u32) -> &mut Self {
+        self.assert_header_not_sent("set_column_hidden");
+        self.inner.set_column_hidden(col);
+        self
+    }
+
+    /// Flush whatever row is still open, send the header if no row ever
+    /// triggered it (an empty sheet, or one that never got past its first
+    /// row), write the footer, and close the zip entry. Call this once, per
+    /// sheet, instead of `StreamingWorkbook::finish_worksheet` (which takes
+    /// a `StreamingWorksheet`, not this type).
+    pub fn finish(mut self) -> Result<(), WriteError> {
+        self.inner.flush_pending_row();
+        if !self.header_written {
+            self.write_header()?;
+        }
+        if !self.inner.body.is_empty() {
+            self.zip.write_all(&self.inner.body)?;
+            self.inner.body.clear();
+        }
+        let mut footer = Vec::new();
+        sheet::write_sheet_footer(&self.inner.merges, &mut footer);
+        self.zip.write_all(&footer)?;
+        Ok(())
+    }
+}
+
 impl<W: Write + Seek> StreamingWorkbook<W> {
     /// Wrap `sink` (e.g. a `File`) in a new, empty streaming workbook.
     /// Nothing is written to `sink` yet — the OPC/zip format doesn't
@@ -541,6 +868,43 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
     /// sheet is even created.
     pub fn finish_worksheet(&mut self, sheet: StreamingWorksheet) -> Result<(), WriteError> {
         finish_and_write_sheet(sheet.inner, sheet.number, sheet.active, &mut self.zip)
+    }
+
+    /// Like `new_worksheet`, but the caller declares the sheet's used range
+    /// upfront (`last_row`/`last_col`, zero-based inclusive — the same
+    /// values `Worksheet.dim` would otherwise only know after every cell is
+    /// written). Every other sheet type in this crate (`Worksheet`,
+    /// `StreamingWorksheet`) buffers the *whole* sheet's encoded bytes
+    /// (`body: Vec<u8>`) until it's finished, because `BrtWsDim` must be
+    /// written before any row data and the real extent isn't known until
+    /// the last cell is written. Declaring the extent upfront breaks that
+    /// dependency: the header can be sent as soon as the first row is
+    /// finished, and every row after that streams straight to the zip entry
+    /// and is dropped immediately — peak memory for this sheet is one row's
+    /// encoded bytes, not the whole sheet's.
+    ///
+    /// The returned `SizedStreamingWorksheet` borrows `self` for its
+    /// lifetime, so the borrow checker enforces "finish this sheet before
+    /// starting another" — the same rule `StreamingWorksheet` only documents
+    /// as a convention (see `finish_worksheet`'s doc comment).
+    pub fn new_worksheet_sized(
+        &mut self,
+        name: &str,
+        last_row: u32,
+        last_col: u32,
+    ) -> SizedStreamingWorksheet<'_, W> {
+        self.sheet_names.push(name.to_owned());
+        let number = self.sheet_names.len();
+        let active = number == 1;
+        SizedStreamingWorksheet {
+            inner: Worksheet::new(name, Rc::clone(&self.sst), Rc::clone(&self.style_builder)),
+            zip: &mut self.zip,
+            number,
+            active,
+            last_row,
+            last_col,
+            header_written: false,
+        }
     }
 
     /// Write every workbook-wide part (content types, `workbook.bin`,
@@ -690,6 +1054,31 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "already flushed to the output")]
+    fn set_row_height_after_that_row_has_flushed_panics() {
+        let mut wb = Workbook::new();
+        let sheet = wb.add_worksheet("Sheet1");
+        sheet.write_number(0, 0, 1.0);
+        sheet.write_number(1, 0, 2.0); // starting row 1 flushes row 0
+        sheet.set_row_height(0, 40.0); // too late — row 0 is already gone
+    }
+
+    #[test]
+    fn set_row_height_before_that_row_flushes_still_applies() {
+        // Regression guard for the panic above: the check must trigger
+        // only once a row is truly gone, not merely because *some* later
+        // row exists — setting height on the still-pending row (or an
+        // upcoming one) must keep working exactly as before.
+        let mut wb = Workbook::new();
+        let sheet = wb.add_worksheet("Sheet1");
+        sheet.write_number(0, 0, 1.0);
+        sheet.set_row_height(0, 40.0); // row 0 still pending — fine
+        sheet.set_row_hidden(2); // a future row — fine
+        sheet.write_number(1, 0, 2.0);
+        sheet.write_number(2, 0, 3.0);
+    }
+
+    #[test]
     fn rewriting_a_cell_in_the_still_open_row_keeps_the_latest_value() {
         let mut wb = Workbook::new();
         let sheet = wb.add_worksheet("Sheet1");
@@ -731,5 +1120,66 @@ mod tests {
         assert!(zip.by_name("xl/styles.bin").is_ok());
         assert!(zip.by_name("xl/sharedStrings.bin").is_ok());
         assert!(zip.by_name("xl/workbook.bin").is_ok());
+    }
+
+    #[test]
+    fn sized_streaming_workbook_produces_valid_zip() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut wb = StreamingWorkbook::create(&mut buf);
+
+        let mut sheet1 = wb.new_worksheet_sized("Sheet1", 4, 1);
+        sheet1.write_string(0, 0, "Name").unwrap();
+        sheet1.write_number(0, 1, 42.0).unwrap();
+        sheet1.finish().unwrap();
+
+        let mut sheet2 = wb.new_worksheet_sized("Sheet2", 0, 0);
+        sheet2.write_boolean(0, 0, true).unwrap();
+        sheet2.finish().unwrap();
+
+        wb.finish().unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(&bytes[..2], b"PK");
+
+        let cursor = Cursor::new(&bytes);
+        let mut zip = zip::ZipArchive::new(cursor).unwrap();
+        assert!(zip.by_name("xl/worksheets/sheet1.bin").is_ok());
+        assert!(zip.by_name("xl/worksheets/sheet2.bin").is_ok());
+        assert!(zip.by_name("xl/styles.bin").is_ok());
+        assert!(zip.by_name("xl/sharedStrings.bin").is_ok());
+        assert!(zip.by_name("xl/workbook.bin").is_ok());
+    }
+
+    /// An empty sized sheet (extent declared, nothing ever written) must
+    /// still produce a well-formed part: `finish` has to send the header
+    /// itself since no row-flush ever triggered it.
+    #[test]
+    fn sized_streaming_empty_sheet_still_produces_valid_zip() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut wb = StreamingWorkbook::create(&mut buf);
+        let sheet = wb.new_worksheet_sized("Empty", 99, 9);
+        sheet.finish().unwrap();
+        wb.finish().unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(&bytes[..2], b"PK");
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the extent")]
+    fn sized_streaming_cell_outside_declared_extent_panics() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut wb = StreamingWorkbook::create(&mut buf);
+        let mut sheet = wb.new_worksheet_sized("Sheet1", 2, 2);
+        sheet.write_number(3, 0, 1.0).unwrap(); // row 3 > declared last_row 2
+    }
+
+    #[test]
+    #[should_panic(expected = "already been written")]
+    fn sized_streaming_layout_call_after_header_sent_panics() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut wb = StreamingWorkbook::create(&mut buf);
+        let mut sheet = wb.new_worksheet_sized("Sheet1", 5, 5);
+        sheet.write_number(0, 0, 1.0).unwrap();
+        sheet.write_number(1, 0, 2.0).unwrap(); // flushes row 0 -> sends the header
+        sheet.set_column_width(0, 20.0); // too late — header already sent
     }
 }

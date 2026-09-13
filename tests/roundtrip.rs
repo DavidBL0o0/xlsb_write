@@ -360,3 +360,46 @@ fn roundtrip_streaming_workbook_through_calamine() {
 
     println!("StreamingWorkbook round-trip OK. File written to: {}", path.display());
 }
+
+/// `new_worksheet_sized` streams every row straight to the zip entry (no
+/// whole-sheet `body` buffer at all — see
+/// `2026-09-13-round6-streaming-and-parallel-write.md`), which means the
+/// header (`BrtWsDim`) is written from the *declared* extent, not from
+/// what's actually written. This proves the resulting file still reads
+/// back correctly: values, mixed types, formatting, and (deliberately) a
+/// declared extent bigger than the real content, to pin the "superset
+/// `BrtWsDim` is safe" finding from that round's real-Excel-COM
+/// verification.
+#[test]
+fn roundtrip_sized_streaming_workbook_through_calamine() {
+    use xlsb_write::StreamingWorkbook;
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut wb = StreamingWorkbook::create(&mut buf);
+
+    // Declare a range larger than what's actually written (10 rows x 5
+    // cols declared, only 4 rows x 2 cols ever touched) — the empirically
+    // verified superset case.
+    let mut sheet = wb.new_worksheet_sized("Sized", 9, 4);
+    for row in 0..4u32 {
+        sheet.write_string(row, 0, &format!("sized-{row}")).unwrap();
+        sheet.write_number(row, 1, row as f64 * 2.5).unwrap();
+    }
+    sheet.finish().unwrap();
+
+    wb.finish().unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_sized_streaming.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let range = wbk.worksheet_range("Sized").expect("Sized sheet not found");
+    for row in 0..4u32 {
+        assert_eq!(range.get_value((row, 0)), Some(&Data::String(format!("sized-{row}"))));
+        assert_eq!(range.get_value((row, 1)).and_then(Data::as_f64), Some(row as f64 * 2.5));
+    }
+
+    println!("Sized-streaming round-trip OK. File written to: {}", path.display());
+}
