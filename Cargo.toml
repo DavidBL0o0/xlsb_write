@@ -1,0 +1,21 @@
+[package]
+name = "xlsb_write"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, pure-Rust writer for the Excel Binary (.xlsb) file format — no COM, no Excel, no Python."
+license = "MIT"
+repository = "https://github.com/DavidBL0o0/xlsb_write"
+readme = "README.md"
+keywords = ["excel", "xlsb", "xlsx", "spreadsheet", "biff12"]
+categories = ["encoding", "parser-implementations"]
+exclude = ["docs/", "data_test/", "test_fixtures/", ".claude/"]
+
+[dependencies]
+indexmap = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+calamine = "0.26"
+parquet = { version = "53", default-features = false, features = ["zstd", "snap", "brotli", "lz4"] }
+polars = { version = "0.55.2", default-features = false, features = ["parquet"] }
+rand = "0.10.2"
