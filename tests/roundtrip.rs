@@ -410,3 +410,82 @@ fn roundtrip_sized_streaming_workbook_through_calamine() {
 
     println!("Sized-streaming round-trip OK. File written to: {}", path.display());
 }
+
+/// `Workbook::define_name` — unlike autofilter (see `tests/autofilter.rs`;
+/// calamine has no concept of it at all), calamine DOES expose defined
+/// names via `Reader::defined_names()`, returning `(name, formula_text)`
+/// pairs it decodes from the same `BrtName`/`BrtExternSheet` records this
+/// crate now writes — so this is a genuine independent-reader check, not
+/// just a structural one. Two names: one on the first sheet (reuses XTI
+/// entry 0), one on a later sheet (needs its own new XTI entry) — see
+/// `wb_part.rs`'s module doc comment for why that distinction matters.
+#[test]
+fn roundtrip_defined_names_through_calamine() {
+    let mut wb = Workbook::new();
+    let sheet1 = wb.add_worksheet("Sheet1");
+    sheet1.write_string(0, 0, "A1");
+    sheet1.write_string(1, 1, "B2");
+    let sheet2 = wb.add_worksheet("Sheet2");
+    sheet2.write_string(2, 2, "C3");
+
+    wb.define_name("FirstSheetRange", 0, 0, 0, 1, 1); // Sheet1!$A$1:$B$2
+    wb.define_name("SecondSheetCell", 1, 2, 2, 2, 2); // Sheet2!$C$3
+
+    let mut buf = Cursor::new(Vec::new());
+    wb.write(&mut buf).unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_defined_names.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let names = wbk.defined_names();
+
+    let first = names
+        .iter()
+        .find(|(n, _)| n == "FirstSheetRange")
+        .expect("FirstSheetRange not found");
+    assert_eq!(first.1, "Sheet1!$A$1:$B$2");
+
+    let second = names
+        .iter()
+        .find(|(n, _)| n == "SecondSheetCell")
+        .expect("SecondSheetCell not found");
+    assert_eq!(second.1, "Sheet2!$C$3:$C$3");
+
+    println!("Defined-names round-trip OK. File written to: {}", path.display());
+}
+
+/// Same as above, but via `StreamingWorkbook` — proves `define_name` works
+/// identically regardless of which workbook type is used, same as every
+/// other workbook-level/per-sheet feature in this crate.
+#[test]
+fn roundtrip_defined_names_streaming_workbook_through_calamine() {
+    use xlsb_write::StreamingWorkbook;
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut wb = StreamingWorkbook::create(&mut buf);
+
+    let mut sheet1 = wb.new_worksheet("Sheet1");
+    sheet1.write_string(0, 0, "A1");
+    wb.finish_worksheet(sheet1).unwrap();
+
+    let mut sheet2 = wb.new_worksheet("Sheet2");
+    sheet2.write_string(0, 0, "A1-on-sheet2");
+    wb.finish_worksheet(sheet2).unwrap();
+
+    wb.define_name("OnSheet2", 1, 0, 0, 0, 0); // Sheet2!$A$1
+
+    wb.finish().unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_defined_names_streaming.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let names = wbk.defined_names();
+    let entry = names.iter().find(|(n, _)| n == "OnSheet2").expect("OnSheet2 not found");
+    assert_eq!(entry.1, "Sheet2!$A$1:$A$1");
+}

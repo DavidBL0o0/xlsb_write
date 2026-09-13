@@ -346,8 +346,10 @@ fn write_rgce_loc_rel(row: u32, col: u32, buf: &mut Vec<u8>) {
 }
 
 /// `ColRelShort`: col(14 bits) | fColRel(1 bit)=0 | fRwRel(1 bit)=0 — always
-/// absolute (see `write_rgce_loc_rel`'s doc comment for why).
-fn col_rel_short(col: u32) -> u16 {
+/// absolute (see `write_rgce_loc_rel`'s doc comment for why). `pub(crate)`
+/// so `wb_part.rs` can reuse it for `BrtName`'s `PtgArea3d` encoding, which
+/// uses the exact same column field shape.
+pub(crate) fn col_rel_short(col: u32) -> u16 {
     (col as u16) & 0x3FFF
 }
 

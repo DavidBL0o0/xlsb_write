@@ -16,6 +16,8 @@ Table of contents:
 - [Number formats in depth](#number-formats-in-depth)
 - [Sheet layout (freeze panes, column/row sizing, merges)](#sheet-layout)
 - [Embedding images](#embedding-images)
+- [Autofilter](#autofilter)
+- [Defined names (named ranges)](#defined-names-named-ranges)
 - [Formulas](#formulas)
 - [Full worked example](#full-worked-example)
 - [Error handling](#error-handling)
@@ -452,6 +454,98 @@ already encodes, formats other than PNG/JPEG (BMP, GIF, TIFF, EMF/WMF),
 and charts (a related but separate, larger subsystem — not implemented at
 all).
 
+## Autofilter
+
+```rust
+sheet.set_autofilter(first_row, first_col, last_row, last_col);
+```
+
+- Turns the inclusive rectangular range `[first_row..=last_row] x
+  [first_col..=last_col]` into an autofilter — the same effect as selecting
+  that range and choosing Data > AutoFilter in Excel. This only turns on
+  the dropdown arrows on the header row; it does not pre-set any filter
+  criteria on any column (there's no API for that yet).
+- A sheet has at most one autofilter range — calling `set_autofilter` again
+  replaces the previous one.
+- Works identically on `Worksheet`, `StreamingWorksheet` (via
+  `Deref`/`DerefMut`), and `SizedStreamingWorksheet` — call it any time
+  before the sheet is finished; like `embed_image`, it has no "before the
+  header is sent" restriction on `SizedStreamingWorksheet`, since
+  autofilter isn't part of the header.
+
+```rust
+use xlsb_write::Workbook;
+
+let mut wb = Workbook::new();
+let sheet = wb.add_worksheet("Sheet1");
+sheet.write_string(0, 0, "Name");
+sheet.write_string(0, 1, "Qty");
+sheet.write_string(1, 0, "Alpha");
+sheet.write_number(1, 1, 10.0);
+sheet.set_autofilter(0, 0, 1, 1); // header + one data row, A1:B2
+wb.save("out.xlsb")?;
+```
+
+Not supported: pre-set filter criteria on any column (values/conditions
+selected in a dropdown) — this only shows the dropdowns, matching "Data >
+AutoFilter" with nothing filtered yet.
+
+## Defined names (named ranges)
+
+```rust
+wb.define_name(name, sheet_index, first_row, first_col, last_row, last_col);
+```
+
+- A **workbook-level** named range (`Formulas > Define Name` in Excel) —
+  this is why `define_name` lives on `Workbook`/`StreamingWorkbook`, not
+  `Worksheet`: named ranges are workbook-scoped even though the range
+  itself lives on one specific sheet.
+- `sheet_index` is the 0-based index of the sheet the range lives on, in
+  the order sheets were added (`add_worksheet`/`new_worksheet`/
+  `new_worksheet_sized` call order) — not validated until `write`/`save`/
+  `finish`, so `define_name` can be called before the target sheet exists
+  yet, as long as it exists by the time the workbook is finished.
+- The range is `[first_row..=last_row] x [first_col..=last_col]`, same
+  zero-based inclusive addressing as everywhere else in this crate.
+
+```rust
+use xlsb_write::Workbook;
+
+let mut wb = Workbook::new();
+let sheet = wb.add_worksheet("Sheet1");
+sheet.write_string(0, 0, "Q1");
+sheet.write_number(1, 0, 42.0);
+
+wb.define_name("Q1Total", 0, 1, 0, 1, 0); // Sheet1!$A$2
+wb.save("out.xlsb")?;
+```
+
+```rust
+use xlsb_write::StreamingWorkbook;
+use std::fs::File;
+
+let file = File::create("out.xlsb")?;
+let mut wb = StreamingWorkbook::create(file);
+let mut sheet = wb.new_worksheet("Sheet1");
+sheet.write_string(0, 0, "Header");
+wb.finish_worksheet(sheet)?;
+wb.define_name("HeaderCell", 0, 0, 0, 0, 0); // can be called before or after finish_worksheet
+wb.finish()?;
+```
+
+Excel opens the file with the name visible in the Name Box (top-left of
+the formula bar) and resolvable in formulas (`=SUM(MyRange)`) — confirmed
+via COM automation (see
+[Correctness](#correctness-how-this-crate-is-verified)).
+
+Not supported:
+- Sheet-scoped names (a name only visible/usable from one specific sheet)
+  — every name this crate writes is workbook-scoped.
+- Names referring to a non-contiguous selection, a formula/constant instead
+  of a cell range, or more than one area.
+- Print areas (`_xlnm.Print_Area`) or other `_xlnm`-prefixed built-in
+  names — `define_name` is for ordinary user-visible named ranges only.
+
 ## Formulas
 
 `Formula` is a small expression builder — there's no text-formula parser
@@ -750,6 +844,35 @@ resizes when the anchor range's column width/row height changes
 merely starts at the right cell) — across all three worksheet types
 (`Workbook`, `StreamingWorkbook`, `SizedStreamingWorksheet`).
 
+**Autofilter and defined names specifically** (`set_autofilter`/
+`define_name`, 2026-09-13): both features' exact record shape and position
+were derived the same real-Excel-reference way, not from spec text alone —
+the published MS-XLSB HTML pages don't render the ABNF grammar that would
+say where `BrtBeginAFilter`/`BrtEndAFilter` belong in the worksheet record
+stream, or that `BrtName`'s range is a full `PtgArea3d` Rgce token stream
+rather than a direct row/col field. This session built several reference
+files with real Excel (COM automation: `Range.AutoFilter`, `Workbook.Names.Add`)
+varying the things most likely to matter — filter range not starting at
+row 0, a multi-sheet workbook with the filter/name on a non-first sheet,
+autofilter combined with an embedded image in the same sheet — and
+inspected each with `examples/dump_sheet.rs`. Confirmed via COM automation
+on this crate's own output across all three worksheet types (`Workbook`,
+`StreamingWorkbook`, `SizedStreamingWorksheet`): the file opens with no
+repair prompt, `Worksheet.AutoFilterMode` is `true` with
+`AutoFilter.Range.Address` matching exactly, and `Workbook.Names` resolves
+each defined name's `RefersToRange` to the correct sheet and address —
+including a name pointing at a sheet other than the first, which exercises
+this crate's dynamically-grown `BrtExternSheet` XTI table, not just the
+single hardcoded entry every workbook already had. Defined names are also
+covered by an independent-reader check in `tests/roundtrip.rs`: `calamine`
+exposes `Reader::defined_names()` and decodes this crate's `BrtName`/
+`BrtExternSheet` output back into `"Sheet!$A$1:$B$2"`-style strings,
+matching exactly. Autofilter has no `calamine`-level check — like embedded
+images, `calamine` is a cell-data reader and doesn't surface autofilter at
+all — so `tests/autofilter.rs` checks the structural shape (the exact
+`BrtBeginAFilter` payload and position) instead, and the real-Excel-COM
+check above is what actually proves correctness for that feature.
+
 ## Limitations — what's not supported
 
 This crate covers "data + formatting + formulas across one or many
@@ -759,7 +882,12 @@ sheets" — the common case for generating reports. It deliberately does
 - **Reading `.xlsb` files.** This is a writer only. (For reading, see
   [`calamine`](https://crates.io/crates/calamine) or
   [`pyxlsb`](https://github.com/willtrnr/pyxlsb) for Python.)
-- **Named ranges, print areas.**
+- **Print areas** and other `_xlnm`-prefixed built-in names. Ordinary
+  workbook-scoped named ranges *are* supported — see
+  [Defined names (named ranges)](#defined-names-named-ranges).
+- **Autofilter column criteria** (pre-selecting which values a dropdown
+  filters to) — `set_autofilter` only turns on the dropdowns themselves,
+  see [Autofilter](#autofilter).
 - **Charts, embedded objects (OLE, ActiveX), image resizing/cropping/rotation,
   image formats other than PNG/JPEG.** Embedding a plain PNG/JPEG image
   anchored to a cell range *is* supported — see
@@ -846,7 +974,10 @@ The crate is organized as:
   blob ever changes).
 - `src/formula.rs` — the `Formula` builder and its Rgce/Ptg token encoder.
 - `src/wb_part.rs` — `xl/workbook.bin`: patches a fixed prefix/suffix
-  template with one `BrtBundleSh` record per sheet.
+  template with one `BrtBundleSh` record per sheet, plus (when
+  `Workbook::define_name`/`StreamingWorkbook::define_name` is used) a
+  dynamically-grown `BrtExternSheet` XTI table and one `BrtName` record per
+  defined name.
 
 Dev tools in `examples/` for working on the binary format itself:
 

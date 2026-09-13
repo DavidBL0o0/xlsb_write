@@ -28,6 +28,46 @@ const RID_BEGIN_MERGE_CELLS: u32 = 177;
 const RID_END_MERGE_CELLS: u32 = 178;
 const RID_MERGE_CELL: u32 = 176;
 
+/// `BrtBeginAFilter`/`BrtEndAFilter` ([MS-XLSB] AUTOFILTER = BrtBeginAFilter
+/// *FILTERCOLUMN [SORTSTATE] BrtEndAFilter — this crate only ever emits the
+/// begin/end pair with no filter columns, i.e. "show the dropdowns" without
+/// pre-set criteria). Like `BrtDrawing`, the published MS-XLSB HTML pages
+/// don't render the ABNF grammar that would say exactly where this pair
+/// belongs in the worksheet record stream or that `BrtBeginAFilter`'s own
+/// payload carries the filtered range, so this was derived empirically
+/// (2026-09-13): built two independent reference files with real Excel
+/// (COM automation, `Range.AutoFilter`) — one with the filter starting at
+/// row 0, one starting mid-sheet on a renamed/reordered multi-sheet
+/// workbook — and inspected both with `examples/dump_sheet.rs`. Both agree:
+/// `BrtBeginAFilter` (161) carries the filtered range as a plain
+/// `UncheckedRfX` (rowFirst/rowLast/colFirst/colLast, 4×u32 LE — the exact
+/// same shape as `BrtWsDim`'s payload above), immediately followed by a
+/// zero-length `BrtEndAFilter` (162) since there are no filter-column
+/// entries. Also confirmed: this pair sits between the sheet-protection
+/// record (rid 535, `FOOTER_MARGINS_LEAD`) and `BrtMargins`
+/// (`FOOTER_MARGINS_TAIL`) — i.e. *before* the margins, not after — and is
+/// wrapped in its own FRT shell (rid 37/38) carrying a copy of the same
+/// per-sheet pseudo-unique identifier the trailing FRT shell at the very
+/// end of the footer also carries (verified: both copies are byte-identical
+/// within one sheet in every real reference file built for this). A fourth
+/// reference file combining autofilter AND an embedded image (see
+/// `drawing.rs`) confirmed the two features' insertion points don't
+/// interact: autofilter's block sits entirely before `BrtMargins`,
+/// `BrtDrawing` sits entirely after it, same relative position as when only
+/// one of the two features is present.
+const RID_BEGIN_AFILTER: u32 = 161;
+const RID_END_AFILTER: u32 = 162;
+/// The FRT (Future Record Type) wrapper used both around the per-sheet
+/// pseudo-unique identifier (rid 3072) at the very end of the footer, and —
+/// when autofilter is present — a second time around a copy of that same
+/// identifier just before `BrtBeginAFilter`. Payload is fixed (verified
+/// identical across every reference file this crate has inspected).
+const RID_FRT_BEGIN: u32 = 37;
+const RID_FRT_END: u32 = 38;
+const RID_FRT_IDENTIFIER: u32 = 3072;
+const FRT_HEADER_PAYLOAD: &[u8] = &[0x01, 0x00, 0x00, 0x10, 0x00, 0x80];
+const RID_END_SHEET: u32 = 130;
+
 /// One `set_column`-style entry: `(col, width_chars, hidden)`.
 pub type ColSpec = (u32, f64, bool);
 
@@ -124,11 +164,60 @@ pub fn write_sheet_header(
 /// `drawing::sheet_rels`, which must agree with this constant).
 const RID_DRAWING: u32 = 550;
 
+/// The sheet-protection record (rid 535) that leads the footer's fixed
+/// tail — verbatim from a real Excel-produced reference file. Ends exactly
+/// where `BrtBeginAFilter`/`BrtEndAFilter` needs to be spliced in when the
+/// sheet has an autofilter (see `RID_BEGIN_AFILTER`'s doc comment) — this
+/// split point (69 bytes: a 3-byte record header + 66-byte payload) was
+/// found by parsing this crate's own (pre-split) footer output back with
+/// `biff12::parse_records`/`read_vi` and locating the record boundary, not
+/// by hand-counting the array, so it can't silently drift if this blob is
+/// ever re-transcribed.
+#[rustfmt::skip]
+const FOOTER_MARGINS_LEAD: &[u8] = &[
+    0x97, 0x04, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+];
+/// `BrtPrintOptions`(477, 2 bytes) + `BrtMargins`(476, 48 bytes) — the rest
+/// of the original single-block footer tail, verbatim from the same
+/// reference file as `FOOTER_MARGINS_LEAD`. `BrtDrawing` (when the sheet has
+/// an image) is spliced in right after this, before the trailing per-sheet
+/// FRT identifier — see `write_sheet_footer`.
+#[rustfmt::skip]
+const FOOTER_MARGINS_TAIL: &[u8] = &[
+    0xdd, 0x03, 0x02,
+    0x10, 0x00, 0xdc, 0x03, 0x30, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0xe6, 0x3f, 0x66, 0x66, 0x66, 0x66, 0x66,
+    0x66, 0xe6, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8,
+    0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f,
+];
+
+/// Write the FRT (Future Record Type) wrapper around a copy of `guid` —
+/// used both for the trailing per-sheet identifier and, when autofilter is
+/// present, a second time immediately before `BrtBeginAFilter` (see
+/// `RID_BEGIN_AFILTER`'s doc comment: real Excel writes the *same* 16 bytes
+/// in both places within one sheet).
+fn write_frt_identifier(guid: &[u8; 16], buf: &mut Vec<u8>) {
+    write_rec(RID_FRT_BEGIN, FRT_HEADER_PAYLOAD, buf);
+    write_rec(RID_FRT_IDENTIFIER, guid, buf);
+    write_r0(RID_FRT_END, buf);
+}
+
 /// `merges`: `(first_row, first_col, last_row, last_col)` per merged range.
 /// `has_drawing`: whether this sheet has any embedded images — emits a
 /// `BrtDrawing` record pointing at `xl/worksheets/_rels/sheetN.bin.rels`'s
 /// `rId1` (the sheet's drawing relationship) when true.
-pub fn write_sheet_footer(merges: &[(u32, u32, u32, u32)], has_drawing: bool, buf: &mut Vec<u8>) {
+/// `autofilter`: `Some((first_row, first_col, last_row, last_col))` when
+/// `Worksheet::set_autofilter` was called — emits `BrtBeginAFilter`/
+/// `BrtEndAFilter` (see `RID_BEGIN_AFILTER`'s doc comment for exact shape
+/// and position, empirically derived).
+pub fn write_sheet_footer(
+    merges: &[(u32, u32, u32, u32)],
+    has_drawing: bool,
+    autofilter: Option<(u32, u32, u32, u32)>,
+    buf: &mut Vec<u8>,
+) {
     buf.extend_from_slice(&[0x92, 0x01, 0x00]); // BrtEndSheetData (146)
 
     if !merges.is_empty() {
@@ -148,58 +237,26 @@ pub fn write_sheet_footer(merges: &[(u32, u32, u32, u32)], has_drawing: bool, bu
         write_r0(RID_END_MERGE_CELLS, buf);
     }
 
-    // 157 bytes verbatim from a real Excel-produced reference file (view/
-    // pane state, default column-break etc.), split into two halves so a
-    // `BrtDrawing` record can be spliced in between them when the sheet
-    // has an image — re-extracted byte-for-byte from a fresh reference
-    // after the previous transcription of this array (during the earlier
-    // ROW_PRE refactor) turned out to be 8 bytes short, which was the
-    // actual cause of Excel discarding the worksheet part on open
-    // ("Replaced Part") — see write_sheet_header's BrtWsDim comment for
-    // the (unrelated, also real) other half of that bug.
-    //
-    // Confirmed against a second, independently-produced real multi-sheet
-    // Excel file (8 sheets vs. the original single-sheet reference) that
-    // every byte here is identical across both files — EXCEPT the 16-byte
-    // value embedded in `FOOTER_TAIL_B` (an `[MS-XLSB]` FRT-wrapped
-    // record, rid 3072): a real Excel file stamps a fresh value on every
-    // sheet, but this crate was copying the SAME 16 bytes (from whichever
-    // one sheet the original reference happened to have) onto every sheet
-    // it ever wrote. Fixed below: that slice is now generated per sheet
-    // instead of baked into the static template.
-    //
-    // The split point (right after `BrtMargins`'s 48-byte payload, right
-    // before the rid-37 wrapper around the per-sheet FRT identifier) is
-    // exactly where a real Excel-authored `.xlsb` with an inserted picture
-    // places its own `BrtDrawing` record — confirmed 2026-09-13 by
-    // building one with Excel itself (COM automation) and dumping its
-    // `sheet1.bin` with `examples/dump_sheet.rs`; this ordering isn't
-    // documented anywhere the published MS-XLSB HTML pages render (the
-    // actual ABNF grammar file they cite isn't included), so it's trusted
-    // from that real reference file, not guessed from spec text alone.
-    #[rustfmt::skip]
-    const FOOTER_TAIL_A: &[u8] = &[
-        0x97, 0x04, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xdd, 0x03, 0x02,
-        0x10, 0x00, 0xdc, 0x03, 0x30, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0xe6, 0x3f, 0x66, 0x66, 0x66, 0x66, 0x66,
-        0x66, 0xe6, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8,
-        0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0xd3, 0x3f,
-    ];
-    // Starts with the rid-37 wrapper (`0x25, 0x06, ...`), then the rid-3072
-    // FRT-wrapped 16-byte identifier (placeholder here — replaced below,
-    // per-sheet), then the fixed 5-byte `[BrtEndList, BrtEndSheet]` tail.
-    #[rustfmt::skip]
-    const FOOTER_TAIL_B: &[u8] = &[
-        0x25,
-        0x06, 0x01, 0x00, 0x00, 0x10, 0x00, 0x80, 0x80, 0x18, 0x10, 0xf0, 0xf8, 0x2a, 0xf4, 0xf1, 0x21, 0x6e, 0x47,
-        0x9c, 0x59, 0xcf, 0x74, 0xd2, 0xaa, 0x32, 0x93, 0x26, 0x00, 0x82, 0x01, 0x00,
-    ];
-    const FOOTER_B_GUID_START: usize = 11;
-    const FOOTER_B_GUID_LEN: usize = 16;
+    buf.extend_from_slice(FOOTER_MARGINS_LEAD);
 
-    buf.extend_from_slice(FOOTER_TAIL_A);
+    // The per-sheet pseudo-unique identifier is generated ONCE per footer
+    // and reused for both FRT-wrapped copies real Excel writes when
+    // autofilter is present (see `RID_BEGIN_AFILTER`'s doc comment) — a
+    // sheet with no autofilter only ever uses it once, at the very end.
+    let guid = crate::biff12::pseudo_unique_16_bytes();
+
+    if let Some((r0, c0, r1, c1)) = autofilter {
+        write_frt_identifier(&guid, buf);
+        let mut pay = [0u8; 16];
+        pay[0..4].copy_from_slice(&r0.to_le_bytes());
+        pay[4..8].copy_from_slice(&r1.to_le_bytes());
+        pay[8..12].copy_from_slice(&c0.to_le_bytes());
+        pay[12..16].copy_from_slice(&c1.to_le_bytes());
+        write_rec(RID_BEGIN_AFILTER, &pay, buf);
+        write_r0(RID_END_AFILTER, buf);
+    }
+
+    buf.extend_from_slice(FOOTER_MARGINS_TAIL);
 
     if has_drawing {
         let mut pay = Vec::new();
@@ -207,15 +264,8 @@ pub fn write_sheet_footer(merges: &[(u32, u32, u32, u32)], has_drawing: bool, bu
         write_rec(RID_DRAWING, &pay, buf);
     }
 
-    // The rid-3072 payload is the 16 bytes at a fixed offset into
-    // `FOOTER_TAIL_B` (see the constants above) — sliced by fixed
-    // start/length, not by a hand-counted offset from the end, so this
-    // can't silently drift out of sync if `FOOTER_TAIL_B` is ever
-    // re-transcribed.
-    let guid_end = FOOTER_B_GUID_START + FOOTER_B_GUID_LEN;
-    buf.extend_from_slice(&FOOTER_TAIL_B[..FOOTER_B_GUID_START]);
-    buf.extend_from_slice(&crate::biff12::pseudo_unique_16_bytes());
-    buf.extend_from_slice(&FOOTER_TAIL_B[guid_end..]);
+    write_frt_identifier(&guid, buf);
+    write_r0(RID_END_SHEET, buf);
 }
 
 /// `BrtColInfo` (rid 60): the first 18 bytes are the fields real readers
@@ -359,9 +409,9 @@ mod tests {
     #[test]
     fn footer_identifier_varies_between_sheets_rest_stays_fixed() {
         let mut buf1 = Vec::new();
-        write_sheet_footer(&[], false, &mut buf1);
+        write_sheet_footer(&[], false, None, &mut buf1);
         let mut buf2 = Vec::new();
-        write_sheet_footer(&[], false, &mut buf2);
+        write_sheet_footer(&[], false, None, &mut buf2);
 
         assert_eq!(
             buf1.len(),
@@ -398,7 +448,7 @@ mod tests {
     #[test]
     fn no_drawing_record_when_sheet_has_no_images() {
         let mut buf = Vec::new();
-        write_sheet_footer(&[], false, &mut buf);
+        write_sheet_footer(&[], false, None, &mut buf);
         let recs = crate::biff12::parse_records(&buf);
         assert!(
             !recs.iter().any(|(rid, _)| *rid == RID_DRAWING),
@@ -417,7 +467,7 @@ mod tests {
     #[test]
     fn drawing_record_has_expected_payload_and_position() {
         let mut buf = Vec::new();
-        write_sheet_footer(&[], true, &mut buf);
+        write_sheet_footer(&[], true, None, &mut buf);
         let recs = crate::biff12::parse_records(&buf);
 
         let drawing_positions: Vec<usize> = recs
@@ -460,9 +510,9 @@ mod tests {
     #[test]
     fn drawing_record_adds_exactly_its_own_encoded_length() {
         let mut without = Vec::new();
-        write_sheet_footer(&[], false, &mut without);
+        write_sheet_footer(&[], false, None, &mut without);
         let mut with = Vec::new();
-        write_sheet_footer(&[], true, &mut with);
+        write_sheet_footer(&[], true, None, &mut with);
 
         let mut expected_record = Vec::new();
         let mut pay = Vec::new();
@@ -470,5 +520,102 @@ mod tests {
         write_rec(RID_DRAWING, &pay, &mut expected_record);
 
         assert_eq!(with.len(), without.len() + expected_record.len());
+    }
+
+    /// No autofilter (the default) must not change the footer at all —
+    /// verified the same way as `no_drawing_record_when_sheet_has_no_images`.
+    #[test]
+    fn no_autofilter_records_when_autofilter_is_none() {
+        let mut buf = Vec::new();
+        write_sheet_footer(&[], false, None, &mut buf);
+        let recs = crate::biff12::parse_records(&buf);
+        assert!(
+            !recs
+                .iter()
+                .any(|(rid, _)| *rid == RID_BEGIN_AFILTER || *rid == RID_END_AFILTER),
+            "BrtBeginAFilter/BrtEndAFilter must not appear when autofilter is None"
+        );
+    }
+
+    /// `autofilter = Some(range)` must emit `BrtBeginAFilter` (161, payload
+    /// = the range as rowFirst/rowLast/colFirst/colLast, same shape as
+    /// `BrtWsDim`) immediately followed by a zero-length `BrtEndAFilter`
+    /// (162), sitting right after the sheet-protection record and its own
+    /// FRT-wrapped identifier, and before `BrtPrintOptions`/`BrtMargins` —
+    /// the exact position/shape confirmed against two independent real
+    /// Excel-produced reference files (see `RID_BEGIN_AFILTER`'s doc
+    /// comment).
+    #[test]
+    fn autofilter_record_has_expected_payload_and_position() {
+        let mut buf = Vec::new();
+        write_sheet_footer(&[], false, Some((1, 2, 5, 4)), &mut buf);
+        let recs = crate::biff12::parse_records(&buf);
+
+        let begin_positions: Vec<usize> = recs
+            .iter()
+            .enumerate()
+            .filter(|(_, (rid, _))| *rid == RID_BEGIN_AFILTER)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(begin_positions.len(), 1, "exactly one BrtBeginAFilter expected");
+        let pos = begin_positions[0];
+
+        let (_, payload) = &recs[pos];
+        let mut expected = [0u8; 16];
+        expected[0..4].copy_from_slice(&1u32.to_le_bytes()); // rowFirst
+        expected[4..8].copy_from_slice(&5u32.to_le_bytes()); // rowLast
+        expected[8..12].copy_from_slice(&2u32.to_le_bytes()); // colFirst
+        expected[12..16].copy_from_slice(&4u32.to_le_bytes()); // colLast
+        assert_eq!(payload, &expected);
+
+        // Immediately followed by a zero-length BrtEndAFilter.
+        let (next_rid, next_payload) = &recs[pos + 1];
+        assert_eq!(*next_rid, RID_END_AFILTER);
+        assert!(next_payload.is_empty());
+
+        // Immediately preceded by the rid-37/rid-3072/rid-38 FRT wrapper
+        // carrying the per-sheet identifier.
+        assert_eq!(recs[pos - 1].0, RID_FRT_END);
+        assert_eq!(recs[pos - 2].0, RID_FRT_IDENTIFIER);
+        assert_eq!(recs[pos - 3].0, RID_FRT_BEGIN);
+
+        // And BrtPrintOptions (477) follows right after BrtEndAFilter.
+        assert_eq!(recs[pos + 2].0, 477);
+    }
+
+    /// The FRT-wrapped identifier written just before `BrtBeginAFilter` must
+    /// be byte-identical to the one written at the very end of the footer —
+    /// confirmed against real Excel output that both copies within one
+    /// sheet always match (see `RID_BEGIN_AFILTER`'s doc comment).
+    #[test]
+    fn autofilter_frt_identifier_matches_trailing_identifier() {
+        let mut buf = Vec::new();
+        write_sheet_footer(&[], false, Some((0, 0, 0, 0)), &mut buf);
+        let recs = crate::biff12::parse_records(&buf);
+        let identifiers: Vec<&Vec<u8>> = recs
+            .iter()
+            .filter(|(rid, _)| *rid == RID_FRT_IDENTIFIER)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(identifiers.len(), 2, "expected two FRT-identifier copies");
+        assert_eq!(identifiers[0], identifiers[1]);
+    }
+
+    /// Autofilter and an embedded image can coexist without their insertion
+    /// points colliding — confirmed against a fourth real Excel reference
+    /// file combining both features (see `RID_BEGIN_AFILTER`'s doc comment).
+    #[test]
+    fn autofilter_and_drawing_coexist_in_expected_order() {
+        let mut buf = Vec::new();
+        write_sheet_footer(&[], true, Some((0, 0, 1, 1)), &mut buf);
+        let recs = crate::biff12::parse_records(&buf);
+        let order: Vec<u32> = recs.iter().map(|(rid, _)| *rid).collect();
+
+        let af_pos = order.iter().position(|&r| r == RID_BEGIN_AFILTER).unwrap();
+        let margins_pos = order.iter().position(|&r| r == 476).unwrap();
+        let drawing_pos = order.iter().position(|&r| r == RID_DRAWING).unwrap();
+        assert!(af_pos < margins_pos, "autofilter must come before BrtMargins");
+        assert!(margins_pos < drawing_pos, "BrtDrawing must come after BrtMargins");
+        assert_eq!(order.last(), Some(&RID_END_SHEET));
     }
 }

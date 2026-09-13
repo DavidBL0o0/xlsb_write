@@ -105,6 +105,9 @@ pub struct Worksheet {
     /// time (see `drawing::write_sheet_drawing_parts`), since it has to be
     /// unique across the whole workbook, not just this sheet.
     images: Vec<EmbeddedImage>,
+    /// Set via `set_autofilter` — the header-row dropdown range, if any.
+    /// `(first_row, first_col, last_row, last_col)`, inclusive.
+    autofilter: Option<(u32, u32, u32, u32)>,
     /// Encoded bytes for every row already finished (everything between
     /// `BrtBeginSheetData` and `BrtEndSheetData`) — grows incrementally as
     /// rows are written, instead of the whole sheet being held as a
@@ -151,6 +154,7 @@ impl Worksheet {
             row_specs: BTreeMap::new(),
             merges: Vec::new(),
             images: Vec::new(),
+            autofilter: None,
             body: Vec::new(),
             pending_row: None,
             dim: None,
@@ -483,6 +487,38 @@ impl Worksheet {
         });
         self
     }
+
+    /// Turn the rectangular range `[first_row..=last_row] x
+    /// [first_col..=last_col]` into an autofilter — the usual case is a
+    /// single header row plus its data rows (e.g. `set_autofilter(0, 0, 0,
+    /// last_col)` for a header-only filter range covering all the data
+    /// below it via Excel's own "extend to used range" behavior, or include
+    /// the data rows explicitly). This only turns on the dropdown arrows on
+    /// the header row (equivalent to selecting the range and choosing
+    /// Data > AutoFilter in Excel with no column criteria set yet) — it does
+    /// not pre-set any filter criteria on any column.
+    ///
+    /// A sheet has at most one autofilter range; calling this again replaces
+    /// the previous one.
+    ///
+    /// # Panics
+    /// - If `first_row > last_row` or `first_col > last_col`.
+    /// - If `last_row`/`last_col` is at or past Excel's real worksheet
+    ///   ceiling (same limits as `stage_cell`/`embed_image`).
+    pub fn set_autofilter(&mut self, first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> &mut Self {
+        assert!(
+            first_row <= last_row && first_col <= last_col,
+            "xlsb_write: set_autofilter range ({first_row},{first_col})..=({last_row},{last_col}) is \
+             inverted — first_row/first_col must be <= last_row/last_col."
+        );
+        assert!(
+            last_row < MAX_ROW && last_col < MAX_COL,
+            "xlsb_write: set_autofilter range extends to ({last_row},{last_col}), outside Excel's real \
+             worksheet limits (0..{MAX_ROW} rows x 0..{MAX_COL} columns)."
+        );
+        self.autofilter = Some((first_row, first_col, last_row, last_col));
+        self
+    }
 }
 
 pub(crate) fn zip_options() -> SimpleFileOptions {
@@ -529,7 +565,7 @@ fn finish_and_write_sheet<W: Write + Seek>(
     );
     let has_drawing = !sheet.images.is_empty();
     let mut footer = Vec::new();
-    sheet::write_sheet_footer(&sheet.merges, has_drawing, &mut footer);
+    sheet::write_sheet_footer(&sheet.merges, has_drawing, sheet.autofilter, &mut footer);
 
     zip.start_file(format!("xl/worksheets/sheet{sheet_number}.bin"), zip_options())?;
     zip.write_all(&header)?;
@@ -547,6 +583,7 @@ pub struct Workbook {
     sheets: Vec<Worksheet>,
     sst: Rc<RefCell<sst::Sst>>,
     style_builder: Rc<RefCell<styles::StylesBuilder>>,
+    defined_names: Vec<wb_part::DefinedName>,
 }
 
 impl Workbook {
@@ -561,6 +598,54 @@ impl Workbook {
             Rc::clone(&self.style_builder),
         ));
         self.sheets.last_mut().unwrap()
+    }
+
+    /// Define a workbook-level named range (`Formulas > Define Name` in
+    /// Excel) referring to the rectangular range `[first_row..=last_row] x
+    /// [first_col..=last_col]` on the sheet at `sheet_index` (0-based, in
+    /// `add_worksheet` call order). Named ranges are workbook-scoped, not
+    /// per-sheet — this is why `define_name` lives on `Workbook`, not
+    /// `Worksheet`, even though the range it refers to lives on one
+    /// specific sheet.
+    ///
+    /// `sheet_index` isn't validated until `write`/`save` (sheets can be
+    /// added after `define_name` is called, as long as `sheet_index` is
+    /// valid by the time the workbook is finished).
+    ///
+    /// # Panics
+    /// - At `write`/`save` time, if `sheet_index` is out of range for the
+    ///   sheets actually added.
+    /// - If `first_row > last_row` or `first_col > last_col`.
+    /// - If `last_row`/`last_col` is at or past Excel's real worksheet
+    ///   ceiling (same limits as `Worksheet::stage_cell`).
+    pub fn define_name(
+        &mut self,
+        name: &str,
+        sheet_index: usize,
+        first_row: u32,
+        first_col: u32,
+        last_row: u32,
+        last_col: u32,
+    ) -> &mut Self {
+        assert!(
+            first_row <= last_row && first_col <= last_col,
+            "xlsb_write: define_name(\"{name}\") range ({first_row},{first_col})..=({last_row},{last_col}) is \
+             inverted — first_row/first_col must be <= last_row/last_col."
+        );
+        assert!(
+            last_row < MAX_ROW && last_col < MAX_COL,
+            "xlsb_write: define_name(\"{name}\") range extends to ({last_row},{last_col}), outside Excel's \
+             real worksheet limits (0..{MAX_ROW} rows x 0..{MAX_COL} columns)."
+        );
+        self.defined_names.push(wb_part::DefinedName {
+            name: name.to_owned(),
+            sheet_index,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+        });
+        self
     }
 
     pub fn save<P: AsRef<Path>>(self, path: P) -> Result<(), WriteError> {
@@ -580,6 +665,16 @@ impl Workbook {
 
         let sheet_names: Vec<&str> = self.sheets.iter().map(|s| s.name.as_str()).collect();
         let n = sheet_names.len();
+
+        for dn in &self.defined_names {
+            assert!(
+                dn.sheet_index < n,
+                "xlsb_write: define_name(\"{}\") targets sheet_index {}, but this workbook only has {n} \
+                 sheet(s) (0..{n})",
+                dn.name,
+                dn.sheet_index
+            );
+        }
 
         // Computed from `&self.sheets` before the sheet loop below consumes
         // it (via `into_iter()`) — [Content_Types].xml needs to know, up
@@ -606,7 +701,7 @@ impl Workbook {
         zip.write_all(ROOT_RELS.as_bytes())?;
 
         zip.start_file("xl/workbook.bin", zip_options())?;
-        zip.write_all(&wb_part::build_workbook(&sheet_names))?;
+        zip.write_all(&wb_part::build_workbook(&sheet_names, &self.defined_names))?;
 
         zip.start_file("xl/_rels/workbook.bin.rels", zip_options())?;
         zip.write_all(workbook_rels(n).as_bytes())?;
@@ -671,6 +766,9 @@ pub struct StreamingWorkbook<W: Write + Seek> {
     /// Every distinct `ImageFormat` used anywhere in the workbook, for
     /// `[Content_Types].xml`'s `Default Extension` entries.
     image_formats: HashSet<ImageFormat>,
+    /// Set via `define_name` — see `Workbook::define_name`'s doc comment
+    /// (the same workbook-level, not per-sheet, semantics apply here).
+    defined_names: Vec<wb_part::DefinedName>,
 }
 
 /// A `Worksheet` created by `StreamingWorkbook::new_worksheet`. Write cells
@@ -1008,6 +1106,16 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
         self
     }
 
+    /// Same contract as `Worksheet::set_autofilter` — unlike the layout
+    /// methods above (freeze panes, column width), this can be called any
+    /// time before `finish()` regardless of whether the header has already
+    /// been sent: autofilter isn't part of the header, it's written into
+    /// the footer (see `sheet::write_sheet_footer`'s `BrtBeginAFilter`).
+    pub fn set_autofilter(&mut self, first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> &mut Self {
+        self.inner.set_autofilter(first_row, first_col, last_row, last_col);
+        self
+    }
+
     /// Flush whatever row is still open, send the header if no row ever
     /// triggered it (an empty sheet, or one that never got past its first
     /// row), write the footer, close the zip entry, and (if any images were
@@ -1026,7 +1134,7 @@ impl<'a, W: Write + Seek> SizedStreamingWorksheet<'a, W> {
         }
         let has_drawing = !self.inner.images.is_empty();
         let mut footer = Vec::new();
-        sheet::write_sheet_footer(&self.inner.merges, has_drawing, &mut footer);
+        sheet::write_sheet_footer(&self.inner.merges, has_drawing, self.inner.autofilter, &mut footer);
         self.zip.write_all(&footer)?;
 
         if has_drawing {
@@ -1061,7 +1169,42 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
             next_media_index: 1,
             drawing_sheets: Vec::new(),
             image_formats: HashSet::new(),
+            defined_names: Vec::new(),
         }
+    }
+
+    /// Same contract as `Workbook::define_name`. `sheet_index` isn't
+    /// validated until `finish()` — sheets are created incrementally with
+    /// `new_worksheet`/`new_worksheet_sized`, so a `sheet_index` that isn't
+    /// valid yet may become valid by the time `finish()` runs.
+    pub fn define_name(
+        &mut self,
+        name: &str,
+        sheet_index: usize,
+        first_row: u32,
+        first_col: u32,
+        last_row: u32,
+        last_col: u32,
+    ) -> &mut Self {
+        assert!(
+            first_row <= last_row && first_col <= last_col,
+            "xlsb_write: define_name(\"{name}\") range ({first_row},{first_col})..=({last_row},{last_col}) is \
+             inverted — first_row/first_col must be <= last_row/last_col."
+        );
+        assert!(
+            last_row < MAX_ROW && last_col < MAX_COL,
+            "xlsb_write: define_name(\"{name}\") range extends to ({last_row},{last_col}), outside Excel's \
+             real worksheet limits (0..{MAX_ROW} rows x 0..{MAX_COL} columns)."
+        );
+        self.defined_names.push(wb_part::DefinedName {
+            name: name.to_owned(),
+            sheet_index,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+        });
+        self
     }
 
     /// Start a new worksheet. Only the very first worksheet ever created is
@@ -1137,6 +1280,16 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
         let sheet_names: Vec<&str> = self.sheet_names.iter().map(String::as_str).collect();
         let n = sheet_names.len();
 
+        for dn in &self.defined_names {
+            assert!(
+                dn.sheet_index < n,
+                "xlsb_write: define_name(\"{}\") targets sheet_index {}, but this workbook only has {n} \
+                 sheet(s) (0..{n})",
+                dn.name,
+                dn.sheet_index
+            );
+        }
+
         self.zip.start_file("[Content_Types].xml", zip_options())?;
         self.zip
             .write_all(content_types(n, &self.drawing_sheets, &self.image_formats).as_bytes())?;
@@ -1145,7 +1298,8 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
         self.zip.write_all(ROOT_RELS.as_bytes())?;
 
         self.zip.start_file("xl/workbook.bin", zip_options())?;
-        self.zip.write_all(&wb_part::build_workbook(&sheet_names))?;
+        self.zip
+            .write_all(&wb_part::build_workbook(&sheet_names, &self.defined_names))?;
 
         self.zip.start_file("xl/_rels/workbook.bin.rels", zip_options())?;
         self.zip.write_all(workbook_rels(n).as_bytes())?;
@@ -1429,5 +1583,45 @@ mod tests {
         sheet.write_number(0, 0, 1.0).unwrap();
         sheet.write_number(1, 0, 2.0).unwrap(); // flushes row 0 -> sends the header
         sheet.set_column_width(0, 20.0); // too late — header already sent
+    }
+
+    #[test]
+    #[should_panic(expected = "only has 1 sheet")]
+    fn workbook_define_name_with_out_of_range_sheet_index_panics_at_write() {
+        let mut wb = Workbook::new();
+        wb.add_worksheet("Sheet1");
+        wb.define_name("Bad", 1, 0, 0, 0, 0); // only sheet_index 0 exists
+        let mut buf = Cursor::new(Vec::new());
+        wb.write(&mut buf).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "inverted")]
+    fn workbook_define_name_rejects_inverted_range() {
+        let mut wb = Workbook::new();
+        wb.add_worksheet("Sheet1");
+        wb.define_name("Bad", 0, 5, 5, 1, 1); // last < first
+    }
+
+    #[test]
+    fn workbook_define_name_before_sheet_added_is_fine_by_write_time() {
+        // sheet_index isn't validated until write() — a define_name call
+        // referencing a sheet added later must not panic prematurely.
+        let mut wb = Workbook::new();
+        wb.define_name("Later", 0, 0, 0, 1, 1);
+        wb.add_worksheet("Sheet1");
+        let mut buf = Cursor::new(Vec::new());
+        wb.write(&mut buf).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "only has 1 sheet")]
+    fn streaming_workbook_define_name_with_out_of_range_sheet_index_panics_at_finish() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut wb = StreamingWorkbook::create(&mut buf);
+        let sheet = wb.new_worksheet("Sheet1");
+        wb.finish_worksheet(sheet).unwrap();
+        wb.define_name("Bad", 1, 0, 0, 0, 0); // only sheet_index 0 exists
+        wb.finish().unwrap();
     }
 }
