@@ -26,6 +26,48 @@
 //! `IF(ISERROR(x), default, x)`, reusing the same well-verified `IF`
 //! encoding and the classic (pre-2007, stable, well-documented) `Ftab`
 //! index for `ISERROR` (0x0003).
+//!
+//! **Cross-sheet references (2026-09-13, `Formula::sheet_cell`/
+//! `sheet_range`):** a sheet-qualified reference (`Sheet2!A1`,
+//! `Sheet2!B1:B5`) is `PtgRef3d`/`PtgArea3d` — the same shape as
+//! `PtgRef`/`PtgArea` plus a 2-byte `ixti` field indexing into the
+//! workbook's `BrtExternSheet` (rid 362) XTI table (see `wb_part.rs`,
+//! which grew this table for `Workbook::define_name`'s `BrtName` support
+//! first). Byte shape confirmed against a real Excel-authored `.xlsb`
+//! (COM automation, three sheets, `Range.Formula = "=Sheet2!A1"` /
+//! `"=SUM(Sheet2!B1:B5)"` / cross-references in both directions,
+//! inspected with `examples/dump_sheet.rs`):
+//! - `PtgRef3d` (value class `0x5A`, reference class `0x3A`): `ixti`(u16) +
+//!   `row`(u32) + `col`(`ColRelShort`, u16) — 9 bytes total, one more field
+//!   (`ixti`) than plain `PtgRef`.
+//! - `PtgArea3d` (value class `0x5B`, reference class `0x3B`): `ixti`(u16) +
+//!   `rowFirst`(u32) + `rowLast`(u32) + `colFirst`(`ColRelShort`) +
+//!   `colLast`(`ColRelShort`) — 15 bytes total. This is the exact same
+//!   token `wb_part::encode_name` already builds for a `BrtName`'s range
+//!   (`PtgArea3d`, cce=15) — see `encode_ptg_area_3d` below, extracted so
+//!   both call sites share one verified encoder instead of drifting apart.
+//! - A single-range `SUM` over a cross-sheet range (`SUM(Sheet2!B1:B5)`)
+//!   gets the exact same `PtgAttrSum` shortcut as a same-sheet
+//!   `SUM(range)` (see the `Formula::Func`/`SUM` match arm below) —
+//!   confirmed against the same reference file.
+//! - Real Excel sets `ColRelShort`'s `fColRel`/`fRwRel` bits for a
+//!   `Range.Formula`-typed cross-sheet reference (since typing `A1` without
+//!   `$` is a *relative* reference by default) — this crate's own
+//!   `Formula::sheet_cell`/`sheet_range` deliberately do NOT reproduce that
+//!   (same choice already made for same-sheet `Formula::Ref`/`Formula::Range`
+//!   — see `write_rgce_loc_rel`'s doc comment): always absolute
+//!   (`col_rel_short`, bits clear), which computes the identical result
+//!   without the signed-offset/wraparound rules relative encoding implies,
+//!   and was confirmed to still open with no repair dialog and compute the
+//!   correct value via the same real-Excel-COM round-trip method as every
+//!   other formula feature in this crate.
+//! - `ixti` itself is workbook-wide shared, incrementally-growing state,
+//!   NOT something `Formula::encode` can resolve on its own (a `Formula` is
+//!   built independently of which `Workbook`/`Worksheet` it ends up written
+//!   into) — see `SheetRegistry` below for how this crate threads that
+//!   state through from `Worksheet::write_formula_num`/... down to
+//!   `Formula::encode_into`, and `wb_part.rs`'s module doc comment for the
+//!   companion piece (how `BrtExternSheet` itself is finally emitted).
 
 use crate::biff12::{write_rec, write_wstr};
 
@@ -116,6 +158,18 @@ pub enum Formula {
     Ref(u32, u32),
     /// A rectangular range, zero-based `(first_row, first_col, last_row, last_col)`.
     Range(u32, u32, u32, u32),
+    /// A single-cell reference on ANOTHER sheet, encoded as `PtgRef3d`
+    /// (value class `0x5A`) — `(sheet_name, row, col)`. Constructed via
+    /// `Formula::sheet_cell`; see the module doc comment's "Cross-sheet
+    /// references" section for the byte shape and how `ixti` (the index
+    /// into `ixti`'s field into the workbook's `BrtExternSheet` XTI table)
+    /// gets resolved at encode time via `SheetRegistry`.
+    Ref3d(String, u32, u32),
+    /// A rectangular range on ANOTHER sheet, encoded as `PtgArea3d`
+    /// (reference class `0x3B`) — `(sheet_name, first_row, first_col,
+    /// last_row, last_col)`. Constructed via `Formula::sheet_range`. See
+    /// `Ref3d`'s doc comment.
+    Range3d(String, u32, u32, u32, u32),
     Add(Box<Formula>, Box<Formula>),
     Sub(Box<Formula>, Box<Formula>),
     Mul(Box<Formula>, Box<Formula>),
@@ -172,6 +226,37 @@ impl Formula {
         Formula::Func(
             FnIndex::SUM,
             vec![Formula::range(first_row, first_col, last_row, last_col)],
+        )
+    }
+
+    /// A single-cell reference on another sheet, e.g.
+    /// `Formula::sheet_cell("Data", 0, 0)` for `=Data!A1`. `sheet_name` must
+    /// name a sheet already added to the workbook (via `add_worksheet`/
+    /// `new_worksheet`/`new_worksheet_sized`) by the time this formula is
+    /// actually written to a cell — resolution happens then, not here (a
+    /// `Formula` is built independently of any `Workbook`); see
+    /// `SheetRegistry::resolve_by_name`'s panic message for what happens
+    /// otherwise.
+    pub fn sheet_cell(sheet_name: &str, row: u32, col: u32) -> Self {
+        Formula::Ref3d(sheet_name.to_owned(), row, col)
+    }
+    /// A rectangular range on another sheet, e.g.
+    /// `Formula::sheet_range("Data", 0, 0, 9, 0)` for `=Data!A1:A10`. Same
+    /// sheet-must-already-exist contract as `Formula::sheet_cell`.
+    pub fn sheet_range(sheet_name: &str, first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> Self {
+        Formula::Range3d(sheet_name.to_owned(), first_row, first_col, last_row, last_col)
+    }
+    /// `SUM` over a range on another sheet, e.g. `=SUM(Data!B1:B10)` — gets
+    /// the same `PtgAttrSum` shortcut as `Formula::sum_range` (see the
+    /// `Formula::Func`/`SUM` match arm in `encode_into`), confirmed against
+    /// the same real-Excel reference file as `Formula::sheet_cell`'s doc
+    /// comment.
+    pub fn sum_sheet_range(sheet_name: &str, first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> Self {
+        Formula::Func(
+            FnIndex::SUM,
+            vec![Formula::sheet_range(
+                sheet_name, first_row, first_col, last_row, last_col,
+            )],
         )
     }
     // `add`/`sub`/`mul`/`div` deliberately name-match `std::ops` (this is a
@@ -372,20 +457,49 @@ impl Formula {
             | Formula::Gt(a, b)
             | Formula::Ne(a, b) => a.is_volatile() || b.is_volatile(),
             Formula::If(c, t, e) => c.is_volatile() || t.is_volatile() || e.is_volatile(),
-            Formula::Num(_) | Formula::Str(_) | Formula::Bool(_) | Formula::Ref(_, _) | Formula::Range(_, _, _, _) => {
-                false
-            }
+            Formula::Num(_)
+            | Formula::Str(_)
+            | Formula::Bool(_)
+            | Formula::Ref(_, _)
+            | Formula::Range(_, _, _, _)
+            | Formula::Ref3d(_, _, _)
+            | Formula::Range3d(_, _, _, _, _) => false,
         }
     }
 
-    /// Encode this formula to an Rgce token stream (postfix/RPN).
+    /// Encode this formula to an Rgce token stream (postfix/RPN), with no
+    /// workbook context. Safe for any formula that contains no
+    /// `Formula::sheet_cell`/`sheet_range` (`Ref3d`/`Range3d`) node — i.e.
+    /// every formula this crate's own test suite built before cross-sheet
+    /// references existed. Real cell writes always go through
+    /// `encode_with`, called from `write_fmla_num`/`write_fmla_string`/
+    /// `write_fmla_bool` with the workbook's real, shared `SheetRegistry` —
+    /// this zero-argument convenience exists only so tests that don't
+    /// involve cross-sheet references don't need to construct a throwaway
+    /// registry just to call `encode`. `#[cfg(test)]` since production code
+    /// never calls it (a `Ref3d`/`Range3d` node encoded this way would get
+    /// its `ixti` from a private, throwaway registry — always disjoint from
+    /// whatever real `BrtExternSheet` table the actual workbook ends up
+    /// building — so this must never reach an actual cell write).
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
+        self.encode_with(&mut SheetRegistry::new())
+    }
+
+    /// Encode this formula to an Rgce token stream (postfix/RPN), resolving
+    /// any `Ref3d`/`Range3d` node's sheet name to an `ixti` via `xti` —
+    /// registering a new `BrtExternSheet` entry the first time a given
+    /// sheet is referenced, exactly like `Workbook::define_name`'s own
+    /// `BrtName` range does (see `SheetRegistry`'s doc comment). This is
+    /// the real, production encode path — `write_fmla_num`/
+    /// `write_fmla_string`/`write_fmla_bool` all go through it.
+    pub(crate) fn encode_with(&self, xti: &mut SheetRegistry) -> Vec<u8> {
         let mut out = Vec::new();
-        self.encode_into(&mut out);
+        self.encode_into(xti, &mut out);
         out
     }
 
-    fn encode_into(&self, out: &mut Vec<u8>) {
+    fn encode_into(&self, xti: &mut SheetRegistry, out: &mut Vec<u8>) {
         match self {
             Formula::Num(v) => {
                 out.push(0x1F); // PtgNum: ptg(7 bits)=0x1F, reserved0(1 bit)=0
@@ -427,59 +541,81 @@ impl Formula {
                 out.extend_from_slice(&(col_rel_short(*c0)).to_le_bytes());
                 out.extend_from_slice(&(col_rel_short(*c1)).to_le_bytes());
             }
+            Formula::Ref3d(sheet_name, row, col) => {
+                // PtgRef3d, value class (0x1A base | (0x2<<5) = 0x5A) —
+                // confirmed byte-for-byte against real Excel's encoding of
+                // a whole-formula cross-sheet cell reference (`=Sheet2!A1`)
+                // in `examples/dump_sheet.rs`-inspected COM-automation
+                // reference file (see module doc comment). Same
+                // `ixti`+`row`+`col` field order/sizes as `PtgRef`, with
+                // `ixti` (resolved via the shared `SheetRegistry`) inserted
+                // right after the opcode.
+                let ixti = xti.resolve_by_name(sheet_name);
+                out.push(0x5A);
+                out.extend_from_slice(&ixti.to_le_bytes());
+                write_rgce_loc_rel(*row, *col, out);
+            }
+            Formula::Range3d(sheet_name, r0, c0, r1, c1) => {
+                // PtgArea3d, reference class (0x1B base | (0x0<<5) = 0x3B) —
+                // the exact same token `wb_part::encode_name` already builds
+                // for a `BrtName`'s range; see `encode_ptg_area_3d` (shared
+                // by both call sites) and the module doc comment.
+                let ixti = xti.resolve_by_name(sheet_name);
+                encode_ptg_area_3d(ixti, *r0, *c0, *r1, *c1, out);
+            }
             Formula::Add(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x03); // PtgAdd
             }
             Formula::Sub(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x04); // PtgSub
             }
             Formula::Mul(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x05); // PtgMul
             }
             Formula::Div(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x06); // PtgDiv
             }
             Formula::Concat(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x08); // PtgConcat — confirmed byte-for-byte against real Excel's `=A1&B1`.
             }
             Formula::Lt(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x09); // PtgLt
             }
             Formula::Le(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x0A); // PtgLe
             }
             Formula::Eq(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x0B); // PtgEq
             }
             Formula::Ge(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x0C); // PtgGe
             }
             Formula::Gt(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x0D); // PtgGt
             }
             Formula::Ne(a, b) => {
-                a.encode_into(out);
-                b.encode_into(out);
+                a.encode_into(xti, out);
+                b.encode_into(xti, out);
                 out.push(0x0E); // PtgNe
             }
             Formula::Func(fn_idx, args) if *fn_idx == FnIndex::SUM && args.len() == 1 => {
@@ -491,15 +627,19 @@ impl Formula {
                 // PtgFuncVar here instead is spec-legal but, combined with
                 // the reference-vs-value class mismatch this shortcut sits
                 // on top of, is what triggered Excel's dynamic-array engine
-                // to insert a spurious `@` into these formulas on load.
-                args[0].encode_into(out);
+                // to insert a spurious `@` into these formulas on load. This
+                // arm matches regardless of whether `args[0]` is a same-sheet
+                // `Range` or a cross-sheet `Range3d` — `SUM(Sheet2!B1:B5)`
+                // gets the identical shortcut, confirmed against the same
+                // reference file (see module doc comment).
+                args[0].encode_into(xti, out);
                 out.push(0x19); // PtgAttrSum
                 out.push(0x10); // bitSum
                 out.extend_from_slice(&[0x00, 0x00]); // unused
             }
             Formula::Func(fn_idx, args) => {
                 for arg in args {
-                    arg.encode_into(out);
+                    arg.encode_into(xti, out);
                 }
                 out.push(0x42); // PtgFuncVar, class=VALUE(0x2): 0x02 | (0x2<<5)
                 out.push(args.len() as u8); // cparams
@@ -520,7 +660,7 @@ impl Formula {
                 out.push(0x01); // bitSemi
                 out.extend_from_slice(&[0x00, 0x00]); // offset = 0 (no args to skip)
                 for arg in args {
-                    arg.encode_into(out);
+                    arg.encode_into(xti, out);
                 }
                 out.push(0x41); // PtgFunc, class=VALUE — confirmed byte-for-byte
                 out.extend_from_slice(&fn_idx.0.to_le_bytes()); // iftab, no cparams byte
@@ -534,15 +674,15 @@ impl Formula {
                 // `Ftab`/`iftab` entry itself, not from anything in the
                 // token stream.
                 for arg in args {
-                    arg.encode_into(out);
+                    arg.encode_into(xti, out);
                 }
                 out.push(0x41); // PtgFunc, class=VALUE
                 out.extend_from_slice(&fn_idx.0.to_le_bytes()); // iftab
             }
             Formula::If(cond, then, else_) => {
-                cond.encode_into(out);
-                let then_bytes = then.encode();
-                let else_bytes = else_.encode();
+                cond.encode_into(xti, out);
+                let then_bytes = then.encode_with(xti);
+                let else_bytes = else_.encode_with(xti);
                 const GOTO_SIZE: u16 = 4;
                 const FUNCVAR_SIZE: u16 = 4; // opcode(1) + cparams(1) + tab(2)
 
@@ -618,6 +758,157 @@ pub(crate) fn col_rel_short(col: u32) -> u16 {
     (col as u16) & 0x3FFF
 }
 
+/// `PtgArea3d`, reference class ([MS-XLS]/[MS-XLSB] Ptg grammar) — a
+/// sheet-qualified rectangular range reference, confirmed byte-for-byte
+/// against real Excel-authored `BrtName` records (see `wb_part.rs`'s module
+/// doc comment) AND a real Excel-authored cross-sheet cell-formula
+/// `SUM(Sheet2!B1:B5)` (see this module's doc comment) — both encode the
+/// identical 15-byte token.
+pub(crate) const PTG_AREA_3D: u8 = 0x3B;
+
+/// Encode a complete `PtgArea3d` token (opcode + `ixti` + sheet-qualified
+/// range) into `out`. Shared by `Formula::Range3d`'s own encoder and
+/// `wb_part::encode_name` (a workbook `BrtName`'s range field is ALSO
+/// always a `PtgArea3d` token stream, `cce`=15) — one encoder for both call
+/// sites instead of two copies that could silently drift apart. `ixti` must
+/// already be resolved (via `SheetRegistry` for a formula, or
+/// `SheetRegistry::resolve_by_index` for a defined name) — this function
+/// itself has no workbook context.
+pub(crate) fn encode_ptg_area_3d(
+    ixti: u16,
+    row_first: u32,
+    col_first: u32,
+    row_last: u32,
+    col_last: u32,
+    out: &mut Vec<u8>,
+) {
+    out.push(PTG_AREA_3D);
+    out.extend_from_slice(&ixti.to_le_bytes());
+    out.extend_from_slice(&row_first.to_le_bytes());
+    out.extend_from_slice(&row_last.to_le_bytes());
+    out.extend_from_slice(&col_rel_short(col_first).to_le_bytes());
+    out.extend_from_slice(&col_rel_short(col_last).to_le_bytes());
+}
+
+/// Workbook-wide, incrementally-growing registry backing cross-sheet
+/// references — [MS-XLSB]'s `BrtExternSheet` (rid 362) XTI table, shared
+/// (`Rc<RefCell<_>>`-wrapped, one per workbook — see `Worksheet`'s/
+/// `Workbook`'s `sheet_registry` field in `lib.rs`) between:
+/// - `Formula::sheet_cell`/`sheet_range` (`Ref3d`/`Range3d`), whose
+///   `PtgRef3d`/`PtgArea3d` bytes are committed to a sheet's output the
+///   moment that cell's row is flushed — for a streaming/sized-streaming
+///   sheet, that can be well before a *later* sheet even exists as a
+///   `Worksheet` object — so `ixti` has to be resolved incrementally, at
+///   encode time, not deferred to workbook-finish time the way `BrtName`'s
+///   `PtgArea3d` is (see below); and
+/// - `Workbook::define_name`/`StreamingWorkbook::define_name`, whose
+///   `BrtName` record is built once, at the very end, by
+///   `wb_part::build_workbook` — using this SAME table so a formula cell's
+///   already-written bytes and the final `BrtExternSheet` record this
+///   registry backs always agree on the same `ixti` numbering, regardless
+///   of which of the two registered a given sheet first.
+///
+/// Entry 0 is always `itab = 0`, unconditionally — required by the
+/// pre-existing leftover `BrtName` record baked into `wb_part::WB_SUFFIX`
+/// (hardcodes `ixti = 0`; see that module's doc comment) — so a workbook
+/// using neither `define_name` nor a cross-sheet formula still produces
+/// byte-identical `BrtExternSheet` output to before this feature existed
+/// (confirmed: real Excel's own XTI table, with no defined names and no
+/// pre-existing leftover record to accommodate, has NO such reserved first
+/// entry — entries there are ordered purely by first-reference order,
+/// confirmed against the same COM-automation reference file — so this
+/// reserved slot is specifically a compatibility artifact of this crate's
+/// own vendored `WB_SUFFIX` template, not a general BIFF12/XLSB rule).
+pub(crate) struct SheetRegistry {
+    /// Every sheet's name, in creation order — position IS that sheet's
+    /// 0-based sheet index (matches the `sheet_names` slice passed to
+    /// `wb_part::build_workbook`). Appended the moment a sheet is created
+    /// (`Workbook::add_worksheet`/`StreamingWorkbook::new_worksheet`/
+    /// `new_worksheet_sized`) — `resolve_by_name` can only find a sheet
+    /// already in this list (see its own doc comment: no forward
+    /// references to a not-yet-created sheet).
+    names: Vec<String>,
+    /// `BrtExternSheet`'s XTI dedup table: `itabs[ixti] == sheet_index`.
+    itabs: Vec<u32>,
+}
+
+impl SheetRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            itabs: vec![0],
+        }
+    }
+
+    /// Record a newly-created sheet's name at its (already-known) index —
+    /// called once, immediately, by `add_worksheet`/`new_worksheet`/
+    /// `new_worksheet_sized`, so any *later* sheet's cross-sheet formula
+    /// can resolve this name via `resolve_by_name`.
+    pub(crate) fn register_sheet(&mut self, name: &str) {
+        self.names.push(name.to_owned());
+    }
+
+    /// Resolve an already-known 0-based sheet index (used by
+    /// `Workbook::define_name`, which takes an index directly, not a name)
+    /// to its `ixti`, registering a new `BrtExternSheet` entry the first
+    /// time this sheet index is referenced by ANYTHING — a formula or a
+    /// defined name, whichever happens first.
+    pub(crate) fn resolve_by_index(&mut self, sheet_index: u32) -> u16 {
+        self.itabs.iter().position(|&t| t == sheet_index).unwrap_or_else(|| {
+            self.itabs.push(sheet_index);
+            self.itabs.len() - 1
+        }) as u16
+    }
+
+    /// Resolve a sheet NAME (used by `Formula::sheet_cell`/`sheet_range` —
+    /// a formula only knows the target sheet's name, not its index) to its
+    /// `ixti`.
+    ///
+    /// # Panics
+    /// If `name` doesn't match any sheet created so far — see this type's
+    /// doc comment: a cross-sheet formula's bytes are committed to output
+    /// the moment its row is flushed, which can happen before a sheet
+    /// created *later* in the same program even exists, so forward
+    /// references aren't supported. Add the target sheet (`add_worksheet`/
+    /// `new_worksheet`/`new_worksheet_sized`) before writing a formula that
+    /// references it.
+    fn resolve_by_name(&mut self, name: &str) -> u16 {
+        let idx = self.names.iter().position(|n| n == name).unwrap_or_else(|| {
+            panic!(
+                "xlsb_write: formula references sheet \"{name}\", which doesn't exist (yet) in \
+                 this workbook — add_worksheet/new_worksheet/new_worksheet_sized must be called \
+                 for the target sheet BEFORE writing a formula (Formula::sheet_cell/sheet_range) \
+                 that references it; forward references to a not-yet-created sheet aren't \
+                 supported."
+            )
+        });
+        self.resolve_by_index(idx as u32)
+    }
+
+    /// The final `BrtExternSheet` payload (`cXti` + one `iSupBook`(0)/
+    /// `itabFirst`/`itabLast` entry per registered itab) — built once, by
+    /// `wb_part::build_workbook`, after every formula in the workbook has
+    /// already been encoded (and thus every entry it could possibly need
+    /// already registered) and every defined name has been resolved via
+    /// `resolve_by_index`.
+    pub(crate) fn build_externsheet_payload(&self) -> Vec<u8> {
+        let mut pay = Vec::with_capacity(4 + self.itabs.len() * 12);
+        pay.extend_from_slice(&(self.itabs.len() as u32).to_le_bytes()); // cXti
+        for &itab in &self.itabs {
+            pay.extend_from_slice(&0u32.to_le_bytes()); // iSupBook = 0 (this workbook)
+            pay.extend_from_slice(&itab.to_le_bytes()); // itabFirst
+            pay.extend_from_slice(&itab.to_le_bytes()); // itabLast
+        }
+        pay
+    }
+}
+
+impl Default for SheetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The cell-record `grbitFlags` value for a volatile formula (`TODAY`/
 /// `NOW`), confirmed byte-for-byte against real Excel's own `BrtFmlaNum`
 /// output for `=TODAY()`/`=NOW()` (both had `grbitFlags=0x0002`; a
@@ -636,8 +927,17 @@ fn fmla_grbit_flags(formula: &Formula) -> u16 {
 /// Write a `BrtFmlaNum` record: a formula cell whose most recent evaluation
 /// produced a numeric value. `cached_value` is what viewers (including
 /// calamine, and Excel before its own recalculation) display immediately.
-pub fn write_fmla_num(col: u32, ixfe: u16, cached_value: f64, formula: &Formula, buf: &mut Vec<u8>) {
-    let rgce = formula.encode();
+/// `xti` resolves any `Formula::sheet_cell`/`sheet_range` node in `formula`
+/// to its `ixti` — see `SheetRegistry`'s doc comment.
+pub(crate) fn write_fmla_num(
+    col: u32,
+    ixfe: u16,
+    cached_value: f64,
+    formula: &Formula,
+    xti: &mut SheetRegistry,
+    buf: &mut Vec<u8>,
+) {
+    let rgce = formula.encode_with(xti);
     let mut pay = Vec::with_capacity(26 + rgce.len());
     pay.extend_from_slice(&col.to_le_bytes());
     pay.extend_from_slice(&(ixfe as u32).to_le_bytes()); // iStyleRef (low 24 bits) | fPhShow=0 | reserved=0
@@ -650,9 +950,17 @@ pub fn write_fmla_num(col: u32, ixfe: u16, cached_value: f64, formula: &Formula,
 }
 
 /// Write a `BrtFmlaString` record: a formula cell whose most recent
-/// evaluation produced a string value.
-pub fn write_fmla_string(col: u32, ixfe: u16, cached_value: &str, formula: &Formula, buf: &mut Vec<u8>) {
-    let rgce = formula.encode();
+/// evaluation produced a string value. See `write_fmla_num`'s doc comment
+/// for `xti`.
+pub(crate) fn write_fmla_string(
+    col: u32,
+    ixfe: u16,
+    cached_value: &str,
+    formula: &Formula,
+    xti: &mut SheetRegistry,
+    buf: &mut Vec<u8>,
+) {
+    let rgce = formula.encode_with(xti);
     let mut pay = Vec::with_capacity(10 + rgce.len());
     pay.extend_from_slice(&col.to_le_bytes());
     pay.extend_from_slice(&(ixfe as u32).to_le_bytes());
@@ -671,8 +979,15 @@ pub fn write_fmla_string(col: u32, ixfe: u16, cached_value: &str, formula: &Form
 /// `BrtFmlaNum` uses) + `grbitFlags`(2) + `cce`(4) + `rgce` + `cb`(4))
 /// confirmed byte-for-byte against real Excel's own encoding of
 /// `=AND(A1>0,A2>0)`.
-pub fn write_fmla_bool(col: u32, ixfe: u16, cached_value: bool, formula: &Formula, buf: &mut Vec<u8>) {
-    let rgce = formula.encode();
+pub(crate) fn write_fmla_bool(
+    col: u32,
+    ixfe: u16,
+    cached_value: bool,
+    formula: &Formula,
+    xti: &mut SheetRegistry,
+    buf: &mut Vec<u8>,
+) {
+    let rgce = formula.encode_with(xti);
     let mut pay = Vec::with_capacity(19 + rgce.len());
     pay.extend_from_slice(&col.to_le_bytes());
     pay.extend_from_slice(&(ixfe as u32).to_le_bytes());
@@ -756,7 +1071,14 @@ mod tests {
     #[test]
     fn fmla_num_record_is_well_formed() {
         let mut buf = Vec::new();
-        write_fmla_num(1, 0, 55.0, &Formula::sum_range(1, 0, 10, 1), &mut buf);
+        write_fmla_num(
+            1,
+            0,
+            55.0,
+            &Formula::sum_range(1, 0, 10, 1),
+            &mut SheetRegistry::new(),
+            &mut buf,
+        );
         let recs = parse_records(&buf);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].0, crate::biff12::RID_FMLA_NUM);
@@ -972,7 +1294,7 @@ mod tests {
     #[test]
     fn fmla_num_sets_volatile_grbit_flags_only_when_needed() {
         let mut buf = Vec::new();
-        write_fmla_num(0, 0, 46000.0, &Formula::today(), &mut buf);
+        write_fmla_num(0, 0, 46000.0, &Formula::today(), &mut SheetRegistry::new(), &mut buf);
         let recs = parse_records(&buf);
         let payload = &recs[0].1;
         // col(4) + ixfe(4) + f64(8) = 16, grbitFlags at [16..18]
@@ -984,6 +1306,7 @@ mod tests {
             0,
             46000.0,
             &Formula::date(Formula::num(2026.0), Formula::num(9.0), Formula::num(13.0)),
+            &mut SheetRegistry::new(),
             &mut buf2,
         );
         let recs2 = parse_records(&buf2);
@@ -1037,6 +1360,7 @@ mod tests {
             0,
             true,
             &Formula::and(vec![Formula::cell(0, 0).gt(Formula::num(0.0))]),
+            &mut SheetRegistry::new(),
             &mut buf,
         );
         let recs = parse_records(&buf);

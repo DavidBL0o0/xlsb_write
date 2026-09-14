@@ -18,6 +18,7 @@ Table of contents:
 - [Embedding images](#embedding-images)
 - [Autofilter](#autofilter)
 - [Defined names (named ranges)](#defined-names-named-ranges)
+- [Cross-sheet formula references](#cross-sheet-formula-references)
 - [Formulas](#formulas)
 - [Full worked example](#full-worked-example)
 - [Error handling](#error-handling)
@@ -545,6 +546,47 @@ Not supported:
   of a cell range, or more than one area.
 - Print areas (`_xlnm.Print_Area`) or other `_xlnm`-prefixed built-in
   names — `define_name` is for ordinary user-visible named ranges only.
+
+## Cross-sheet formula references
+
+```rust
+Formula::sheet_cell(sheet_name: &str, row: u32, col: u32) -> Formula        // e.g. =Data!A1
+Formula::sheet_range(sheet_name, first_row, first_col, last_row, last_col)  // e.g. =Data!A1:A10
+Formula::sum_sheet_range(sheet_name, first_row, first_col, last_row, last_col) // =SUM(Data!A1:A10)
+```
+
+A formula on one sheet referencing a cell/range on another sheet:
+
+```rust
+let mut wb = Workbook::new();
+let data = wb.add_worksheet("Data");
+data.write_number(0, 0, 10.0);
+data.write_number(1, 0, 20.0);
+data.write_number(2, 0, 30.0);
+
+let summary = wb.add_worksheet("Summary");
+summary.write_formula_num(0, 0, Formula::sheet_cell("Data", 0, 0), 10.0); // =Data!A1
+summary.write_formula_num(1, 0, Formula::sum_sheet_range("Data", 0, 0, 2, 0), 60.0); // =SUM(Data!A1:A3)
+```
+
+- **The target sheet must already exist** (already passed to
+  `add_worksheet`/`new_worksheet`/`new_worksheet_sized`) at the moment the
+  formula's row is written — a cross-sheet formula's bytes are committed
+  to output as soon as that row flushes (see
+  [Writing cells](#writing-cells)'s row-ordering rule), which can happen
+  before a sheet created *later* in your program even exists. Referencing
+  a not-yet-created sheet panics with a clear message. In practice: create
+  every sheet a formula might reference before writing that formula, which
+  is the order every example in this guide already uses.
+- Works identically across `Workbook`, `StreamingWorkbook`, and
+  `SizedStreamingWorksheet` — same as every other formula feature.
+- Composes with `define_name`: both share the same underlying workbook-wide
+  sheet registry, so a cross-sheet formula and a defined name pointing at
+  the same sheet correctly resolve to the same internal reference — you
+  don't need to think about this, it's automatic.
+- Cell/range references are always absolute (matches this crate's existing
+  same-sheet `Formula::cell`/`Formula::range` choice — see
+  [Formulas](#formulas)).
 
 ## Formulas
 

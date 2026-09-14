@@ -99,6 +99,13 @@ pub struct Worksheet {
     /// (inside `flush_pending_row`, via `sheet::encode_row`), not in a
     /// second pass over the whole workbook at write time.
     sst: Rc<RefCell<sst::Sst>>,
+    /// Workbook-wide cross-sheet-reference registry, shared with every
+    /// other sheet and with `Workbook`/`StreamingWorkbook`'s own
+    /// `define_name` — see `formula::SheetRegistry`'s doc comment. Read at
+    /// row-flush time by `flush_pending_row` (via `sheet::encode_row`) to
+    /// resolve any `Formula::sheet_cell`/`sheet_range` node's target sheet
+    /// name to its `ixti`.
+    sheet_registry: Rc<RefCell<formula::SheetRegistry>>,
     /// Distinct text values written to this sheet — see `intern_string`.
     strings: HashSet<Rc<str>>,
     freeze_row: u32,
@@ -147,12 +154,25 @@ const MAX_ROW: u32 = 1_048_576;
 const MAX_COL: u32 = 16_384;
 
 impl Worksheet {
-    fn new(name: &str, sst: Rc<RefCell<sst::Sst>>, style_builder: Rc<RefCell<styles::StylesBuilder>>) -> Self {
+    /// Registers `name` with `sheet_registry` immediately (before this
+    /// function returns) — see `formula::SheetRegistry::register_sheet`'s
+    /// doc comment for why this must happen at creation time, unconditionally,
+    /// not lazily on first cell write: a *later* sheet's cross-sheet formula
+    /// needs to be able to find this sheet by name even if this sheet itself
+    /// never writes a single cell.
+    fn new(
+        name: &str,
+        sst: Rc<RefCell<sst::Sst>>,
+        style_builder: Rc<RefCell<styles::StylesBuilder>>,
+        sheet_registry: Rc<RefCell<formula::SheetRegistry>>,
+    ) -> Self {
+        sheet_registry.borrow_mut().register_sheet(name);
         Self {
             name: name.to_owned(),
             style_builder,
             format_ids: HashMap::new(),
             sst,
+            sheet_registry,
             strings: HashSet::new(),
             freeze_row: 0,
             freeze_col: 0,
@@ -203,6 +223,7 @@ impl Worksheet {
             height_twips,
             hidden,
             &mut self.sst.borrow_mut(),
+            &mut self.sheet_registry.borrow_mut(),
             &mut self.body,
         );
         self.last_flushed_row = Some(pending.row);
@@ -608,6 +629,7 @@ pub struct Workbook {
     sheets: Vec<Worksheet>,
     sst: Rc<RefCell<sst::Sst>>,
     style_builder: Rc<RefCell<styles::StylesBuilder>>,
+    sheet_registry: Rc<RefCell<formula::SheetRegistry>>,
     defined_names: Vec<wb_part::DefinedName>,
 }
 
@@ -621,6 +643,7 @@ impl Workbook {
             name,
             Rc::clone(&self.sst),
             Rc::clone(&self.style_builder),
+            Rc::clone(&self.sheet_registry),
         ));
         self.sheets.last_mut().unwrap()
     }
@@ -688,7 +711,13 @@ impl Workbook {
     pub fn write<W: Write + Seek>(self, sink: W) -> Result<(), WriteError> {
         let mut zip = ZipWriter::new(sink);
 
-        let sheet_names: Vec<&str> = self.sheets.iter().map(|s| s.name.as_str()).collect();
+        // Owned (not borrowed from `self.sheets`) — the sheet loop below
+        // consumes `self.sheets` via `into_iter()`, and `xl/workbook.bin`
+        // can only be built *after* that loop (it needs `self.sheet_registry`
+        // fully populated with every cross-sheet formula's XTI entry, which
+        // only happens as each sheet's rows flush during the loop) — so this
+        // needs to outlive the move, not just borrow through it.
+        let sheet_names: Vec<String> = self.sheets.iter().map(|s| s.name.clone()).collect();
         let n = sheet_names.len();
 
         for dn in &self.defined_names {
@@ -725,9 +754,12 @@ impl Workbook {
         zip.start_file("_rels/.rels", zip_options())?;
         zip.write_all(ROOT_RELS.as_bytes())?;
 
-        zip.start_file("xl/workbook.bin", zip_options())?;
-        zip.write_all(&wb_part::build_workbook(&sheet_names, &self.defined_names))?;
-
+        // `xl/workbook.bin` is deliberately NOT written here (even though
+        // every other workbook-wide part is) — see `sheet_names`' doc
+        // comment above. It's written after the sheet loop below instead,
+        // once `self.sheet_registry` has every cross-sheet formula's XTI
+        // entry as well as every `define_name`'s. The OPC/zip format
+        // doesn't require parts in any particular order, so this is safe.
         zip.start_file("xl/_rels/workbook.bin.rels", zip_options())?;
         zip.write_all(workbook_rels(n).as_bytes())?;
 
@@ -748,6 +780,17 @@ impl Workbook {
             let active = sheet_idx == 0;
             finish_and_write_sheet(sheet, sheet_idx + 1, active, &mut next_media_index, &mut zip)?;
         }
+
+        // Now that every sheet has flushed, `self.sheet_registry` has every
+        // cross-sheet formula's XTI entry — safe to build the final
+        // `xl/workbook.bin` (see the comment where this was moved from).
+        let sheet_name_refs: Vec<&str> = sheet_names.iter().map(String::as_str).collect();
+        zip.start_file("xl/workbook.bin", zip_options())?;
+        zip.write_all(&wb_part::build_workbook(
+            &sheet_name_refs,
+            &self.defined_names,
+            &mut self.sheet_registry.borrow_mut(),
+        ))?;
 
         zip.start_file("xl/sharedStrings.bin", zip_options())?;
         zip.write_all(&self.sst.borrow().encode())?;
@@ -780,6 +823,14 @@ pub struct StreamingWorkbook<W: Write + Seek> {
     zip: ZipWriter<W>,
     sst: Rc<RefCell<sst::Sst>>,
     style_builder: Rc<RefCell<styles::StylesBuilder>>,
+    /// See `Worksheet.sheet_registry`'s doc comment. By the time `finish`
+    /// runs, every sheet has already been created (`new_worksheet`/
+    /// `new_worksheet_sized`) and finished (`finish_worksheet`/
+    /// `SizedStreamingWorksheet::finish`), so this is already fully
+    /// populated — no reordering needed here the way `Workbook::write`
+    /// needed, since sheets are flushed incrementally as they're built,
+    /// not all at once at the very end.
+    sheet_registry: Rc<RefCell<formula::SheetRegistry>>,
     sheet_names: Vec<String>,
     /// Shared across every sheet's images so `xl/media/imageN` numbering
     /// stays unique workbook-wide (see `drawing::write_sheet_drawing_parts`).
@@ -1215,6 +1266,7 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
             zip: ZipWriter::new(sink),
             sst: Rc::new(RefCell::new(sst::Sst::new())),
             style_builder: Rc::new(RefCell::new(styles::StylesBuilder::new())),
+            sheet_registry: Rc::new(RefCell::new(formula::SheetRegistry::new())),
             sheet_names: Vec::new(),
             next_media_index: 1,
             drawing_sheets: Vec::new(),
@@ -1262,7 +1314,12 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
     pub fn new_worksheet(&mut self, name: &str) -> StreamingWorksheet {
         self.sheet_names.push(name.to_owned());
         StreamingWorksheet {
-            inner: Worksheet::new(name, Rc::clone(&self.sst), Rc::clone(&self.style_builder)),
+            inner: Worksheet::new(
+                name,
+                Rc::clone(&self.sst),
+                Rc::clone(&self.style_builder),
+                Rc::clone(&self.sheet_registry),
+            ),
             number: self.sheet_names.len(),
             active: self.sheet_names.len() == 1,
         }
@@ -1309,7 +1366,12 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
         let number = self.sheet_names.len();
         let active = number == 1;
         SizedStreamingWorksheet {
-            inner: Worksheet::new(name, Rc::clone(&self.sst), Rc::clone(&self.style_builder)),
+            inner: Worksheet::new(
+                name,
+                Rc::clone(&self.sst),
+                Rc::clone(&self.style_builder),
+                Rc::clone(&self.sheet_registry),
+            ),
             zip: &mut self.zip,
             number,
             active,
@@ -1348,8 +1410,11 @@ impl<W: Write + Seek> StreamingWorkbook<W> {
         self.zip.write_all(ROOT_RELS.as_bytes())?;
 
         self.zip.start_file("xl/workbook.bin", zip_options())?;
-        self.zip
-            .write_all(&wb_part::build_workbook(&sheet_names, &self.defined_names))?;
+        self.zip.write_all(&wb_part::build_workbook(
+            &sheet_names,
+            &self.defined_names,
+            &mut self.sheet_registry.borrow_mut(),
+        ))?;
 
         self.zip.start_file("xl/_rels/workbook.bin.rels", zip_options())?;
         self.zip.write_all(workbook_rels(n).as_bytes())?;

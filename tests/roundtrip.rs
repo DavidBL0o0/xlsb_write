@@ -650,3 +650,71 @@ fn roundtrip_defined_names_streaming_workbook_through_calamine() {
     let entry = names.iter().find(|(n, _)| n == "OnSheet2").expect("OnSheet2 not found");
     assert_eq!(entry.1, "Sheet2!$A$1:$A$1");
 }
+
+/// A formula on one sheet referencing another sheet (`Formula::sheet_cell`/
+/// `sum_sheet_range`, `PtgRef3d`/`PtgArea3d`) must read back the same
+/// computed value calamine independently derives from the cell's cached
+/// value — same proof-of-correctness bar as every other formula in this
+/// crate (`roundtrip_formulas_through_calamine`).
+#[test]
+fn roundtrip_cross_sheet_formulas_through_calamine() {
+    let mut wb = Workbook::new();
+    let data = wb.add_worksheet("Data");
+    data.write_number(0, 0, 10.0); // A1
+    data.write_number(1, 0, 20.0); // A2
+    data.write_number(2, 0, 30.0); // A3
+
+    let summary = wb.add_worksheet("Summary");
+    summary.write_formula_num(0, 0, Formula::sheet_cell("Data", 0, 0), 10.0); // =Data!A1
+    summary.write_formula_num(1, 0, Formula::sum_sheet_range("Data", 0, 0, 2, 0), 60.0); // =SUM(Data!A1:A3)
+
+    let mut buf = Cursor::new(Vec::new());
+    wb.write(&mut buf).unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_cross_sheet.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let range = wbk.worksheet_range("Summary").expect("Summary sheet missing");
+    assert_eq!(range.get_value((0, 0)).and_then(Data::as_f64), Some(10.0), "=Data!A1");
+    assert_eq!(
+        range.get_value((1, 0)).and_then(Data::as_f64),
+        Some(60.0),
+        "=SUM(Data!A1:A3)"
+    );
+
+    println!("Cross-sheet formula round-trip OK. File written to: {}", path.display());
+}
+
+/// Same as above, but via `StreamingWorkbook` — the target sheet ("Data")
+/// must be created (registering its name) before the referencing sheet's
+/// formula is written, which is exactly the natural order every existing
+/// example already uses.
+#[test]
+fn roundtrip_cross_sheet_formulas_streaming_workbook_through_calamine() {
+    use xlsb_write::StreamingWorkbook;
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut wb = StreamingWorkbook::create(&mut buf);
+
+    let mut data = wb.new_worksheet("Data");
+    data.write_number(0, 0, 100.0);
+    wb.finish_worksheet(data).unwrap();
+
+    let mut summary = wb.new_worksheet("Summary");
+    summary.write_formula_num(0, 0, Formula::sheet_cell("Data", 0, 0), 100.0);
+    wb.finish_worksheet(summary).unwrap();
+
+    wb.finish().unwrap();
+    let bytes = buf.into_inner();
+    assert_eq!(&bytes[..2], b"PK");
+
+    let path = std::env::temp_dir().join("xlsb_write_roundtrip_cross_sheet_streaming.xlsb");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut wbk: Xlsb<_> = open_workbook(&path).expect("calamine failed to open the file");
+    let range = wbk.worksheet_range("Summary").expect("Summary sheet missing");
+    assert_eq!(range.get_value((0, 0)).and_then(Data::as_f64), Some(100.0));
+}

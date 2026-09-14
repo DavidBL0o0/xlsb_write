@@ -331,6 +331,7 @@ pub fn encode_row(
     height_twips: u16,
     hidden: bool,
     sst: &mut crate::sst::Sst,
+    xti: &mut crate::formula::SheetRegistry,
     sheet_buf: &mut Vec<u8>,
 ) {
     sheet_buf.extend_from_slice(ROW_PRE);
@@ -359,13 +360,13 @@ pub fn encode_row(
                 }
             }
             CellValue::FormulaNum(formula, cached) => {
-                crate::formula::write_fmla_num(col, ixfe, *cached, formula, &mut cell_buf);
+                crate::formula::write_fmla_num(col, ixfe, *cached, formula, xti, &mut cell_buf);
             }
             CellValue::FormulaStr(formula, cached) => {
-                crate::formula::write_fmla_string(col, ixfe, cached, formula, &mut cell_buf);
+                crate::formula::write_fmla_string(col, ixfe, cached, formula, xti, &mut cell_buf);
             }
             CellValue::FormulaBool(formula, cached) => {
-                crate::formula::write_fmla_bool(col, ixfe, *cached, formula, &mut cell_buf);
+                crate::formula::write_fmla_bool(col, ixfe, *cached, formula, xti, &mut cell_buf);
             }
         }
     }

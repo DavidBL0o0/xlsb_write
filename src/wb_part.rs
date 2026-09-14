@@ -142,37 +142,6 @@ fn encode_bundle_sh(tab_id: u32, rel_id: &str, name: &str) -> Vec<u8> {
     pay
 }
 
-/// Build `BrtExternSheet`'s XTI table and, for each `defined_names` entry,
-/// the `ixti` value its `PtgArea3d` should use. Entry 0 is always `itab = 0`
-/// — required by the pre-existing leftover `BrtName` record baked into
-/// `WB_SUFFIX`, which hardcodes `ixti = 0` (see module doc comment) — and
-/// one more entry is appended per *additional* distinct sheet index a
-/// `define_name` call references, in order of first appearance. With no
-/// defined names at all, this reproduces the exact same single-entry
-/// (`itab = 0`) table `WB_SUFFIX` already hardcoded, so output for a
-/// workbook with no defined names is byte-identical to before this feature
-/// existed.
-fn build_externsheet(defined_names: &[DefinedName]) -> (Vec<u8>, Vec<u16>) {
-    let mut itabs: Vec<u32> = vec![0];
-    let mut ixtis = Vec::with_capacity(defined_names.len());
-    for dn in defined_names {
-        let sheet_index = dn.sheet_index as u32;
-        let ixti = itabs.iter().position(|&t| t == sheet_index).unwrap_or_else(|| {
-            itabs.push(sheet_index);
-            itabs.len() - 1
-        });
-        ixtis.push(ixti as u16);
-    }
-    let mut pay = Vec::with_capacity(4 + itabs.len() * 12);
-    pay.extend_from_slice(&(itabs.len() as u32).to_le_bytes()); // cXti
-    for &itab in &itabs {
-        pay.extend_from_slice(&0u32.to_le_bytes()); // iSupBook = 0 (this workbook)
-        pay.extend_from_slice(&itab.to_le_bytes()); // itabFirst
-        pay.extend_from_slice(&itab.to_le_bytes()); // itabLast
-    }
-    (pay, ixtis)
-}
-
 /// Encode one `BrtName` record's payload — see module doc comment for how
 /// this shape (including the fixed `NAME_TAIL`) was derived.
 fn encode_name(name: &str, ixti: u16, first_row: u32, first_col: u32, last_row: u32, last_col: u32) -> Vec<u8> {
@@ -202,7 +171,26 @@ fn encode_name(name: &str, ixti: u16, first_row: u32, first_col: u32, last_row: 
 /// names. `defined_names` is normally empty — most workbooks don't use
 /// `define_name` at all, and this function reproduces byte-identical
 /// output to before this feature existed in that case.
-pub fn build_workbook(names: &[&str], defined_names: &[DefinedName]) -> Vec<u8> {
+///
+/// `registry` is the SAME `SheetRegistry` (see its own doc comment in
+/// `formula.rs`) every cross-sheet `Formula::sheet_cell`/`sheet_range` in
+/// this workbook already resolved its `ixti` through at row-flush time —
+/// passed in here (rather than this function computing its own XTI table
+/// from just `defined_names`, as an earlier version of this function did)
+/// so a formula cell's already-written bytes and this function's own
+/// `BrtExternSheet` record always agree on the same numbering, regardless
+/// of whether a formula or a `define_name` call registered a given sheet
+/// first. Each defined name's `ixti` is resolved here, via
+/// `resolve_by_index` — which may itself grow the registry with a new
+/// entry if no formula already referenced that sheet — so this MUST run
+/// after every sheet has finished flushing (every formula's `resolve_by_name`
+/// call has already happened), or a formula flushed *after* this runs
+/// could silently disagree with the table already written here.
+pub fn build_workbook(
+    names: &[&str],
+    defined_names: &[DefinedName],
+    registry: &mut crate::formula::SheetRegistry,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(WB_PREFIX.len() + names.len() * 50 + WB_SUFFIX.len() + defined_names.len() * 80);
     out.extend_from_slice(WB_PREFIX);
     for (i, name) in names.iter().enumerate() {
@@ -214,7 +202,11 @@ pub fn build_workbook(names: &[&str], defined_names: &[DefinedName]) -> Vec<u8> 
 
     out.extend_from_slice(&WB_SUFFIX[..WB_SUFFIX_EXTERNSHEET_START]);
 
-    let (externsheet_payload, ixtis) = build_externsheet(defined_names);
+    let ixtis: Vec<u16> = defined_names
+        .iter()
+        .map(|dn| registry.resolve_by_index(dn.sheet_index as u32))
+        .collect();
+    let externsheet_payload = registry.build_externsheet_payload();
     write_rec(RID_EXTERN_SHEET, &externsheet_payload, &mut out);
 
     out.extend_from_slice(&WB_SUFFIX[WB_SUFFIX_EXTERNSHEET_END..WB_SUFFIX_LEGACY_NAME_END]);
@@ -231,24 +223,27 @@ pub fn build_workbook(names: &[&str], defined_names: &[DefinedName]) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formula::SheetRegistry;
 
     #[test]
     fn single_sheet1_is_531_bytes() {
-        assert_eq!(build_workbook(&["Sheet1"], &[]).len(), 531);
+        assert_eq!(build_workbook(&["Sheet1"], &[], &mut SheetRegistry::new()).len(), 531);
     }
 
     #[test]
     fn multi_sheet_grows() {
-        let wb2 = build_workbook(&["Sales", "Finance"], &[]);
-        let wb3 = build_workbook(&["A", "B", "C"], &[]);
+        let wb2 = build_workbook(&["Sales", "Finance"], &[], &mut SheetRegistry::new());
+        let wb3 = build_workbook(&["A", "B", "C"], &[], &mut SheetRegistry::new());
         assert!(wb2.len() > 531);
         assert!(wb3.len() > wb2.len());
     }
 
-    /// With no defined names, output must be byte-identical to the
-    /// pre-existing hardcoded `WB_SUFFIX` slice this function now rebuilds
-    /// dynamically — i.e. `build_externsheet(&[])` must reproduce exactly
-    /// the same 19 bytes `WB_SUFFIX[9..28]` already had.
+    /// With no defined names (and no cross-sheet formulas — an unused,
+    /// freshly-constructed `SheetRegistry`), output must be byte-identical
+    /// to the pre-existing hardcoded `WB_SUFFIX` slice this function now
+    /// rebuilds dynamically — i.e. a fresh `SheetRegistry`'s
+    /// `build_externsheet_payload()` must reproduce exactly the same 19
+    /// bytes `WB_SUFFIX[9..28]` already had.
     #[test]
     fn no_defined_names_reproduces_original_externsheet_bytes() {
         let mut expected = Vec::new();
@@ -258,8 +253,7 @@ mod tests {
 
         let mut out = Vec::new();
         out.extend_from_slice(&WB_SUFFIX[..WB_SUFFIX_EXTERNSHEET_START]);
-        let (pay, ixtis) = build_externsheet(&[]);
-        assert!(ixtis.is_empty());
+        let pay = SheetRegistry::new().build_externsheet_payload();
         write_rec(RID_EXTERN_SHEET, &pay, &mut out);
         out.extend_from_slice(&WB_SUFFIX[WB_SUFFIX_EXTERNSHEET_END..]);
 
@@ -279,7 +273,12 @@ mod tests {
             last_row: 1,
             last_col: 1,
         }];
-        let (pay, ixtis) = build_externsheet(&names);
+        let mut registry = SheetRegistry::new();
+        let ixtis: Vec<u16> = names
+            .iter()
+            .map(|dn| registry.resolve_by_index(dn.sheet_index as u32))
+            .collect();
+        let pay = registry.build_externsheet_payload();
         assert_eq!(ixtis, vec![0]);
         assert_eq!(u32::from_le_bytes(pay[0..4].try_into().unwrap()), 1, "cXti must stay 1");
     }
@@ -297,7 +296,12 @@ mod tests {
             last_row: 2,
             last_col: 2,
         }];
-        let (pay, ixtis) = build_externsheet(&names);
+        let mut registry = SheetRegistry::new();
+        let ixtis: Vec<u16> = names
+            .iter()
+            .map(|dn| registry.resolve_by_index(dn.sheet_index as u32))
+            .collect();
+        let pay = registry.build_externsheet_payload();
         assert_eq!(ixtis, vec![1]);
         assert_eq!(
             u32::from_le_bytes(pay[0..4].try_into().unwrap()),
@@ -334,8 +338,51 @@ mod tests {
                 last_col: 1,
             },
         ];
-        let (pay, ixtis) = build_externsheet(&names);
+        let mut registry = SheetRegistry::new();
+        let ixtis: Vec<u16> = names
+            .iter()
+            .map(|dn| registry.resolve_by_index(dn.sheet_index as u32))
+            .collect();
+        let pay = registry.build_externsheet_payload();
         assert_eq!(ixtis, vec![1, 1]);
+        assert_eq!(
+            u32::from_le_bytes(pay[0..4].try_into().unwrap()),
+            2,
+            "cXti must be 2, not 3"
+        );
+    }
+
+    /// A cross-sheet FORMULA that already claimed an XTI entry before
+    /// `build_workbook` runs must keep that same `ixti` for a defined name
+    /// on the same sheet — the whole point of sharing one `SheetRegistry`
+    /// between the two mechanisms (see `build_workbook`'s doc comment).
+    #[test]
+    fn defined_name_reuses_xti_entry_a_formula_already_registered() {
+        let mut registry = SheetRegistry::new();
+        // Simulates a cross-sheet formula on sheet index 2 having already
+        // flushed (registering sheet index 2 as the SECOND xti entry, ixti=1)
+        // before any defined name is resolved.
+        let formula_ixti = registry.resolve_by_index(2);
+        assert_eq!(formula_ixti, 1);
+
+        let names = [DefinedName {
+            name: "SameSheet".to_owned(),
+            sheet_index: 2,
+            first_row: 0,
+            first_col: 0,
+            last_row: 0,
+            last_col: 0,
+        }];
+        let ixtis: Vec<u16> = names
+            .iter()
+            .map(|dn| registry.resolve_by_index(dn.sheet_index as u32))
+            .collect();
+        assert_eq!(
+            ixtis,
+            vec![1],
+            "must reuse the formula's xti entry, not allocate a new one"
+        );
+        let pay = registry.build_externsheet_payload();
         assert_eq!(
             u32::from_le_bytes(pay[0..4].try_into().unwrap()),
             2,
@@ -385,7 +432,7 @@ mod tests {
             last_row: 3,
             last_col: 2,
         }];
-        let bytes = build_workbook(&["Sheet1"], &names);
+        let bytes = build_workbook(&["Sheet1"], &names, &mut SheetRegistry::new());
         let recs = crate::biff12::try_parse_records(&bytes).expect("workbook.bin must be well-formed BIFF12");
         let name_recs: Vec<&Vec<u8>> = recs
             .iter()
